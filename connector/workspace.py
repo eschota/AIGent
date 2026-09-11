@@ -394,7 +394,10 @@ class WorkspaceService:
         if name == "exec_command":
             if not self.agent.config["allow_commands"]:
                 return {"error": "Enable command requests in settings"}
-            if not await self.agent.approve(session, "exec_command", args["cmd"], admin_only=True):
+            workdir = safe_path(self.agent.workspace(sid), args.get("workdir", "."))
+            if not workdir.is_dir():
+                raise ValueError("Working directory does not exist")
+            if not await self.agent.approve(session, "exec_command", args["cmd"] + "\ncwd: " + str(workdir), admin_only=True):
                 return {"denied": True}
             tid = await self.start_command(session, args["cmd"], args.get("workdir", "."))
             await asyncio.sleep(min(max(args.get("yield_time_ms", 1000), 100), 10000) / 1000)

@@ -5,7 +5,11 @@ import httpx
 
 
 class ProviderError(Exception):
-    pass
+    """Provider failure. `retryable` marks transient faults worth another attempt."""
+
+    def __init__(self, message, retryable=False):
+        super().__init__(message)
+        self.retryable = retryable
 
 
 def account_usage(raw, model, config, now=None):
@@ -48,6 +52,9 @@ class DeepSeek:
 
     async def complete(self, messages, tools, on_delta):
         c = self.config
+        from .vision import VISION_MODELS, contains_images
+        if contains_images(messages) and c["model"] not in VISION_MODELS:
+            raise ProviderError("Для изображений выберите DeepSeek Flash. Текущая модель не подтверждена как vision-capable.")
         if not c["deepseek_key"]:
             raise ProviderError("Задайте API-ключ DeepSeek в настройках.")
         payload = {"model": c["model"], "messages": messages, "tools": tools,
@@ -59,17 +66,30 @@ class DeepSeek:
                                           headers={"Authorization": f"Bearer {c['deepseek_key']}"},
                                           json=payload, timeout=180) as response:
                 if response.status_code != 200:
-                    await response.aread()
-                    raise ProviderError(f"DeepSeek HTTP {response.status_code}: проверьте ключ, баланс и модель.")
+                    body = (await response.aread()).decode("utf-8", errors="replace")
+                    try:
+                        detail = json.loads(body).get("error", {}).get("message", "")
+                    except ValueError:
+                        detail = body[:300]
+                    hint = {401: "проверьте ключ.", 402: "пополните баланс.", 400: "запрос отклонён.",
+                            429: "лимит запросов; повторяю."}.get(response.status_code, "ошибка провайдера.")
+                    raise ProviderError(c.redact(f"DeepSeek HTTP {response.status_code}: {hint} {detail}".strip())
+                                        if hasattr(c, "redact") else f"DeepSeek HTTP {response.status_code}: {hint} {detail}".strip(),
+                                        retryable=response.status_code in (408, 409, 429, 500, 502, 503, 504))
                 async for line in response.aiter_lines():
                     if not line.startswith("data:"):
                         continue
                     data = line[5:].strip()
                     if data == "[DONE]":
                         break
-                    chunk = json.loads(data)
+                    try:
+                        chunk = json.loads(data)
+                    except ValueError:
+                        continue  # A truncated or keepalive SSE fragment must not end the turn.
+                    if not isinstance(chunk, dict):
+                        continue
                     if chunk.get("error"):
-                        raise ProviderError("DeepSeek остановил поток с ошибкой.")
+                        raise ProviderError("DeepSeek остановил поток с ошибкой.", retryable=True)
                     if chunk.get("usage"):
                         usage = account_usage(chunk["usage"], c["model"], c)
                     for choice in chunk.get("choices", []):
@@ -80,8 +100,9 @@ class DeepSeek:
                         reasoning += delta.get("reasoning_content") or ""
                         if delta.get("reasoning_content"):
                             await on_delta(content, reasoning)
-                        for call in delta.get("tool_calls", []):
-                            item = calls.setdefault(call["index"], {"id": "", "type": "function",
+                        for position, call in enumerate(delta.get("tool_calls") or []):
+                            index = call.get("index", position)
+                            item = calls.setdefault(index, {"id": "", "type": "function",
                                                      "function": {"name": "", "arguments": ""}})
                             if call.get("id"):
                                 item["id"] = call["id"]
@@ -90,14 +111,22 @@ class DeepSeek:
                             item["function"]["arguments"] += function.get("arguments", "")
             message = {"role": "assistant", "content": content or None}
             if calls:
-                message["tool_calls"] = list(calls.values())
+                # A call without an id or name cannot be answered; the API rejects the next request.
+                usable = []
+                for position, item in enumerate(calls[k] for k in sorted(calls)):
+                    if not item["function"]["name"].strip():
+                        continue
+                    item["id"] = item["id"] or f"call_{position}_{abs(hash(item['function']['name'])) % 10**8}"
+                    usable.append(item)
+                if usable:
+                    message["tool_calls"] = usable
             if reasoning:
                 message["reasoning_content"] = reasoning
-            if not content and not calls:
-                raise ProviderError("DeepSeek вернул пустой ответ.")
+            if not content and not message.get("tool_calls"):
+                raise ProviderError("DeepSeek вернул пустой ответ.", retryable=True)
             return message, usage
         except httpx.HTTPError as exc:
-            raise ProviderError(f"Сетевая ошибка DeepSeek ({type(exc).__name__}). Повторите запрос.") from None
+            raise ProviderError(f"Сетевая ошибка DeepSeek ({type(exc).__name__}). Повторите запрос.", retryable=True) from None
 
 
 class TelegramAPI:

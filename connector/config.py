@@ -5,6 +5,8 @@ import os
 import secrets
 from pathlib import Path
 
+from .version import __version__
+
 
 def password_hash(password: str) -> str:
     salt = secrets.token_hex(16)
@@ -30,7 +32,8 @@ class Config:
             "deepseek_key": "", "telegram_token": "", "model": "deepseek-flash",
             "admin_password": "", "chat_password": "", "thinking": True,
             "allow_commands": False, "max_output_tokens": 8192,
-            "max_context_chars": 200000, "max_steps": 12,
+            "max_context_chars": 1000000, "max_steps": 12,
+            "update_repo": "eschota/AIGent", "auto_update_check": True,
             "pricing": {"deepseek-flash": [0.006, 0.3, 1.2], "deepseek-v4-pro": [0.044, 1.32, 3.96]},
             "pricing_date": "2026-09-11", "auth_epoch": 1,
             "connector_token": secrets.token_urlsafe(32),
@@ -58,7 +61,8 @@ class Config:
         return {k: v for k, v in self.values.items() if k not in {
             "deepseek_key", "telegram_token", "admin_password", "chat_password",
             "connector_token", "setup_token", "account_keys",
-        }} | {"deepseek_configured": bool(self["deepseek_key"]),
+        }} | {"version": __version__,
+             "deepseek_configured": bool(self["deepseek_key"]),
              "telegram_configured": bool(self["telegram_token"]), "ready": self.ready}
 
     def redact(self, value):

@@ -16,3 +16,10 @@ dist/
 node_modules/
 desktop/release/
 *.spec
+# agent scratch and attachment landing zones inside a project workspace
+.tmp/
+skills/
+shared/
+autorig/
+*-*-*-*-*.png
+review-*.diff

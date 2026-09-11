@@ -21,7 +21,13 @@ from .providers import DeepSeek, ProviderError, TelegramAPI, account_usage
 from .store import Store
 from .telegram import Bot
 from .local_providers import LocalProviders
+from .updates import UpdateChannel
+from .version import __version__
 from .workspace import WorkspaceService
+from .autorig import AutoRigTools
+from .computer import ComputerTools
+from .skill_manager import SkillIndex
+from .shared_tools import SharedTools
 
 
 class PasswordBody(BaseModel):
@@ -37,12 +43,17 @@ class Settings(BaseModel):
     thinking: bool = True
     allow_commands: bool = False
     max_output_tokens: int = Field(default=8192, ge=256, le=65536)
-    max_context_chars: int = Field(default=200000, ge=8000, le=2000000)
+    max_context_chars: int = Field(default=1000000, ge=8000, le=8000000)
     max_steps: int = Field(default=12, ge=1, le=40)
+    update_repo: str = Field(default="eschota/AIGent", max_length=200)
+    auto_update_check: bool = True
 
 
 class ChatBody(BaseModel):
     text: str = Field(min_length=1, max_length=40000)
+    request_id: str | None = Field(default=None, max_length=100)
+    attachments: list[str] = Field(default_factory=list, max_length=8)
+    queue: bool = True
 
 
 class SessionBody(BaseModel):
@@ -71,6 +82,21 @@ class SessionUpdate(BaseModel):
     effort: str | None = None
     archived: bool | None = None
     pinned: bool | None = None
+    auto_approve: bool | None = None
+    auto_continue: bool | None = None
+    project_id: str | None = None
+
+
+class SkillAttachBody(BaseModel):
+    session_id: str
+
+
+class FileLocation(BaseModel):
+    path: str = Field(min_length=1, max_length=400)
+
+
+class ToolBody(BaseModel):
+    args: dict[str, str | int] = Field(default_factory=dict)
 
 
 class AnswerBody(BaseModel):
@@ -106,6 +132,10 @@ class DecisionBody(BaseModel):
     accepted: bool
 
 
+class ComputerBody(BaseModel):
+    window_id: int | None = None
+
+
 class TelegramBody(BaseModel):
     kind: str
     payload: dict
@@ -128,14 +158,29 @@ def create_app(root: Path | None = None, polling=True):
     agent.local = local
     workspace_service = WorkspaceService(agent)
     agent.workspace_service = workspace_service
+    autorig = AutoRigTools(agent, client)
+    agent.extensions.append(autorig)
+    computer = ComputerTools(agent)
+    agent.extensions.append(computer)
+    skills = SkillIndex(config, store, agent.workspace)
+    shared = SharedTools(agent, client, skills)
+    agent.extensions.append(shared)
     bot = Bot(config, store, telegram, agent)
-    sessions, failures = {}, {}
+    updates = UpdateChannel(client, config["update_repo"])
+    failures = {}
 
     @asynccontextmanager
     async def lifespan(app):
         if polling:
             bot.task = asyncio.create_task(bot.poll())
+        skills.start()
+        shared.resume()
+        for session in store.sessions():
+            if store.queued(session["id"]):
+                agent.drain(session["id"])
         yield
+        await shared.close()
+        await skills.stop()
         if bot.task:
             bot.task.cancel()
             await asyncio.gather(bot.task, return_exceptions=True)
@@ -143,10 +188,12 @@ def create_app(root: Path | None = None, polling=True):
         await client.aclose()
         store.db.close()
 
-    app = FastAPI(title="AIGent", version="0.2.0", lifespan=lifespan,
+    app = FastAPI(title="AIGent", version=__version__, lifespan=lifespan,
                   description="Local agent connector. Authenticate with the admin cookie or connector Bearer token.")
     app.state.config, app.state.store, app.state.agent, app.state.bot = config, store, agent, bot
-    app.state.client = client
+    app.state.client, app.state.skills, app.state.shared = client, skills, shared
+    app.state.started = time.time()
+    app.state.updates = updates
 
     @app.middleware("http")
     async def protections(request, call_next):
@@ -160,7 +207,7 @@ def create_app(root: Path | None = None, polling=True):
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["Cache-Control"] = "no-store"
         if request.url.path == "/":
-            response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'"
+            response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'none'"
         return response
 
     def bearer(request):
@@ -170,10 +217,20 @@ def create_app(root: Path | None = None, polling=True):
         token = bearer(request)
         if token and hmac.compare_digest(token, config["connector_token"]):
             return True
-        entry = sessions.get(request.cookies.get("ide_admin", ""))
-        if entry and entry[0] > time.time() and entry[1] == config["admin_password"]:
+        digest = hashlib.sha256(request.cookies.get("ide_admin", "").encode()).hexdigest()
+        entries = store.rows("SELECT * FROM admin_sessions WHERE token_hash=?", (digest,))
+        entry = entries[0] if entries else None
+        revision = hashlib.sha256(config["admin_password"].encode()).hexdigest()
+        if entry and entry["expires"] > time.time() and hmac.compare_digest(entry["credential_revision"], revision):
             return True
         raise HTTPException(401, "Administrator authentication required")
+
+    def issue_admin_session():
+        token, expires = secrets.token_urlsafe(32), time.time() + 43200
+        store.execute("DELETE FROM admin_sessions WHERE expires<?", (time.time(),))
+        store.execute("INSERT INTO admin_sessions(token_hash,expires,credential_revision) VALUES (?,?,?)",
+                      (hashlib.sha256(token.encode()).hexdigest(), expires, hashlib.sha256(config["admin_password"].encode()).hexdigest()))
+        return token, expires
 
     def require_session(sid):
         session = store.session(sid)
@@ -191,7 +248,7 @@ def create_app(root: Path | None = None, polling=True):
 
     @app.get("/healthz")
     async def health():
-        return {"status": "ok", "service": "aigent", "version": "0.2.0", "configured": config.ready}
+        return {"status": "ok", "service": "aigent", "version": __version__, "configured": config.ready}
 
     @app.get("/api/identity")
     async def identity(nonce: str):
@@ -201,9 +258,8 @@ def create_app(root: Path | None = None, polling=True):
 
     @app.post("/api/desktop/session", dependencies=[Depends(require_admin)])
     async def desktop_session():
-        token = secrets.token_urlsafe(32)
-        sessions[token] = (time.time() + 43200, config["admin_password"])
-        return {"cookie": token, "expires": time.time() + 43200}
+        token, expires = issue_admin_session()
+        return {"cookie": token, "expires": expires}
 
     @app.get("/api/bootstrap")
     async def bootstrap():
@@ -248,14 +304,13 @@ def create_app(root: Path | None = None, polling=True):
             failures[address] = (count + 1, time.time() + 300 if count >= 4 else 0)
             raise HTTPException(401, "Invalid password")
         failures.pop(address, None)
-        token = secrets.token_urlsafe(32)
-        sessions[token] = (time.time() + 43200, config["admin_password"])
+        token, _ = issue_admin_session()
         response.set_cookie("ide_admin", token, httponly=True, samesite="strict", secure=request.url.scheme == "https", max_age=43200)
         return {"ok": True}
 
     @app.post("/api/logout", dependencies=[Depends(require_admin)])
     async def logout(request: Request, response: Response):
-        sessions.pop(request.cookies.get("ide_admin", ""), None)
+        store.execute("DELETE FROM admin_sessions WHERE token_hash=?", (hashlib.sha256(request.cookies.get("ide_admin", "").encode()).hexdigest(),))
         response.delete_cookie("ide_admin")
         return {"ok": True}
 
@@ -274,11 +329,33 @@ def create_app(root: Path | None = None, polling=True):
         config.save()
         return {"token": config["connector_token"]}
 
+    def ui_revision():
+        """Newest timestamp of the served interface files; a changed value means an open page is stale."""
+        folder = Path(__file__).parent / "static"
+        return str(int(max((p.stat().st_mtime for p in folder.iterdir() if p.is_file()), default=0)))
+
+    def supervisor_state():
+        """What the supervisor recorded about restarts and rollbacks, if it is running."""
+        path = config.root / "supervisor.json"
+        if not path.is_file():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            return None
+
     @app.get("/api/status", dependencies=[Depends(require_admin)])
     async def status():
         return {"bot": bot.status, "username": bot.username, "error": bot.last_error,
+                "ui_revision": ui_revision(), "supervisor": supervisor_state(),
+                "started": app.state.started,
                 "usage": store.usage(), "sessions": len(store.sessions()),
                 "running": len(agent.jobs), "model": config["model"]}
+
+    @app.get("/api/update", dependencies=[Depends(require_admin)])
+    async def update_status(force: bool = False):
+        """What the running build is and what the published release offers."""
+        return await updates.check(__version__, force=force)
 
     @app.get("/api/balance", dependencies=[Depends(require_admin)])
     async def balance():
@@ -321,8 +398,32 @@ def create_app(root: Path | None = None, polling=True):
 
     @app.patch("/api/sessions/{sid}", dependencies=[Depends(require_admin)])
     async def update_session(sid: str, body: SessionUpdate):
-        require_session(sid)
-        return store.update_session(sid, **body.model_dump(exclude_none=True))
+        session = require_session(sid)
+        fields = body.model_dump(exclude_unset=True, exclude_none=True)
+        if "project_id" in fields:
+            target = fields["project_id"]
+            if agent.busy(sid) and (target or None) != session.get("project_id"):
+                raise HTTPException(409, "Дождитесь окончания хода или остановите его перед сменой проекта")
+            if target:
+                found = store.rows("SELECT * FROM projects WHERE id=?", (target,))
+                if not found:
+                    raise HTTPException(404, "Project not found")
+                fields["workspace"] = found[0]["path"]
+            else:
+                fields["project_id"], fields["workspace"] = None, None
+        for flag in ("auto_approve", "auto_continue"):
+            if flag in fields:
+                fields[flag] = int(fields[flag])
+        if not fields:
+            return session
+        updated = store.update_session(sid, **fields)
+        if "workspace" in fields:
+            agent._project_guidance.pop(sid, None)
+            store.event(sid, "notice", {"text": "Рабочая папка сессии: " + (updated["workspace"] or "отдельная папка сессии")})
+        if "auto_approve" in fields:
+            store.event(sid, "notice", {"text": "Автоприменение команд и правок: "
+                                                + ("включено" if updated["auto_approve"] else "выключено")})
+        return updated
 
     @app.post("/api/sessions/{sid}/fork", dependencies=[Depends(require_admin)])
     async def fork_session(sid: str):
@@ -352,6 +453,72 @@ def create_app(root: Path | None = None, polling=True):
     @app.get("/api/projects", dependencies=[Depends(require_admin)])
     async def projects():
         return store.rows("SELECT * FROM projects ORDER BY created DESC")
+
+    @app.get("/api/sessions/{sid}/autorig", dependencies=[Depends(require_admin)])
+    async def autorig_status(sid: str):
+        require_session(sid)
+        return autorig.state(sid)
+
+    @app.post("/api/sessions/{sid}/autorig", dependencies=[Depends(require_admin)])
+    async def autorig_enable(sid: str, body: DecisionBody):
+        require_session(sid)
+        return autorig.enable(sid, body.accepted)
+
+    @app.get("/api/computer/windows", dependencies=[Depends(require_admin)])
+    async def computer_windows():
+        return await asyncio.to_thread(computer.desktop.windows) if computer.desktop else []
+
+    @app.get("/api/sessions/{sid}/computer", dependencies=[Depends(require_admin)])
+    async def computer_status(sid: str):
+        require_session(sid)
+        return {"window": computer.bindings.get(sid), "supported": computer.desktop is not None}
+
+    @app.post("/api/sessions/{sid}/computer", dependencies=[Depends(require_admin)])
+    async def computer_select(sid: str, body: ComputerBody):
+        selected = require_session(sid)
+        if selected["provider"] != "deepseek":
+            raise HTTPException(400, "Computer tools currently connect to DeepSeek sessions")
+        return {"window": computer.bind(sid, body.window_id)}
+
+    def media_file(sid: str, path: str):
+        """Serve a workspace image or video for viewing inside the interface, never as a download."""
+        from PIL import Image
+        require_session(sid)
+        file = safe_path(agent.workspace(sid), path)
+        if not file.is_file():
+            raise HTTPException(404, "File not found")
+        video = {".mp4": "video/mp4", ".webm": "video/webm"}.get(file.suffix.lower())
+        if video:
+            return FileResponse(file, media_type=video)
+        try:
+            with Image.open(file) as decoded:
+                if decoded.format not in {"PNG", "JPEG", "WEBP", "GIF"}:
+                    raise HTTPException(415, "Not a supported image")
+                mime = Image.MIME[decoded.format]
+                decoded.verify()
+        except HTTPException:
+            raise
+        except Exception:
+            # A truncated or corrupted file is a normal outcome; the interface shows a placeholder.
+            raise HTTPException(415, "Файл повреждён или не является поддерживаемым изображением") from None
+        return FileResponse(file, media_type=mime)
+
+    @app.get("/api/sessions/{sid}/image", dependencies=[Depends(require_admin)])
+    async def image_preview(sid: str, path: str):
+        return media_file(sid, path)
+
+    @app.post("/api/sessions/{sid}/file-path", dependencies=[Depends(require_admin)])
+    async def file_location(sid: str, body: FileLocation):
+        """The desktop shell needs a real path to put a file on the OS clipboard."""
+        require_session(sid)
+        file = safe_path(agent.workspace(sid), body.path)
+        if not file.is_file():
+            raise HTTPException(404, "File not found")
+        return {"absolute": str(file), "name": file.name, "bytes": file.stat().st_size}
+
+    @app.get("/api/sessions/{sid}/media", dependencies=[Depends(require_admin)])
+    async def media_preview(sid: str, path: str):
+        return media_file(sid, path)
 
     @app.post("/api/projects", dependencies=[Depends(require_admin)])
     async def add_project(body: ProjectBody):
@@ -465,6 +632,42 @@ def create_app(root: Path | None = None, polling=True):
                     store.event(session["id"], "assistant", {"text": item["text"], "provider": "codex"})
         return session
 
+    @app.get("/api/tools", dependencies=[Depends(require_admin)])
+    async def tool_catalogue():
+        return shared.catalogue()
+
+    @app.post("/api/sessions/{sid}/tools/{name}", dependencies=[Depends(require_admin)])
+    async def run_tool(sid: str, name: str, body: ToolBody):
+        session = require_session(sid)
+        return await shared.run(session, name, body.args)
+
+    @app.get("/api/skills/status", dependencies=[Depends(require_admin)])
+    async def skills_status():
+        return skills.status()
+
+    @app.get("/api/skills/tags", dependencies=[Depends(require_admin)])
+    async def skills_tags(limit: int = 30):
+        return skills.tag_cloud(min(max(limit, 1), 100))
+
+    @app.post("/api/skills/rescan", dependencies=[Depends(require_admin)])
+    async def skills_rescan():
+        return await asyncio.to_thread(skills.scan)
+
+    @app.get("/api/skills", dependencies=[Depends(require_admin)])
+    async def skills_search(query: str = "", tags: str = "", source: str = "",
+                            sort: str = "relevant", limit: int = 40):
+        selected = [t for t in tags.split(",") if t.strip()]
+        return skills.search(query[:200], selected, source, sort, min(max(limit, 1), 200))
+
+    @app.get("/api/skills/{skill_id}", dependencies=[Depends(require_admin)])
+    async def skill_detail(skill_id: str):
+        return skills.get(skill_id)
+
+    @app.post("/api/skills/{skill_id}/attach", dependencies=[Depends(require_admin)])
+    async def skill_attach(skill_id: str, body: SkillAttachBody):
+        require_session(body.session_id)
+        return skills.attach(skill_id, body.session_id)
+
     @app.get("/api/questions", dependencies=[Depends(require_admin)])
     async def questions():
         return [{"id": qid, "sid": q["session"]["id"], "questions": q["questions"]} for qid, q in agent.questions.items()]
@@ -516,8 +719,44 @@ def create_app(root: Path | None = None, polling=True):
 
     @app.post("/api/sessions/{sid}/messages", status_code=202, dependencies=[Depends(require_admin)])
     async def send(sid: str, body: ChatBody):
-        agent.start(require_session(sid), body.text)
-        return {"accepted": True}
+        selected = require_session(sid)
+        digest = hashlib.sha256(body.text.encode()).hexdigest()
+        if body.request_id:
+            previous = store.rows("SELECT text_hash FROM message_requests WHERE session_id=? AND request_id=?", (sid, body.request_id))
+            if previous:
+                if previous[0]["text_hash"] != digest:
+                    raise HTTPException(409, "Request id belongs to a different message")
+                return {"accepted": True, "duplicate": True}
+        content = body.text
+        if body.attachments:
+            parts = [{"type": "text", "text": body.text}]
+            for relative in body.attachments:
+                piece = agent.attachment_content(safe_path(agent.workspace(sid), relative))
+                parts.extend(piece if isinstance(piece, list) else [{"type": "text", "text": piece}])
+            content = parts
+        result = agent.submit(selected, content, queue=body.queue)
+        if body.request_id:
+            store.execute("INSERT INTO message_requests(session_id,request_id,text_hash,created) VALUES (?,?,?,?)", (sid, body.request_id, digest, time.time()))
+        return result
+
+    @app.get("/api/sessions/{sid}/context", dependencies=[Depends(require_admin)])
+    async def context_usage(sid: str):
+        require_session(sid)
+        return agent.context_size(sid)
+
+    @app.get("/api/sessions/{sid}/queue", dependencies=[Depends(require_admin)])
+    async def queue_list(sid: str):
+        require_session(sid)
+        return [{"id": item["id"], "created": item["created"],
+                 "text": agent.plain_text(item["payload"])} for item in store.queued(sid)]
+
+    @app.delete("/api/sessions/{sid}/queue", dependencies=[Depends(require_admin)])
+    async def queue_clear(sid: str, item: int | None = None):
+        require_session(sid)
+        removed = store.drop_queued(sid, item)
+        if removed:
+            store.event(sid, "notice", {"text": f"Из очереди удалено сообщений: {removed}"})
+        return {"removed": removed}
 
     @app.post("/api/sessions/{sid}/stop", dependencies=[Depends(require_admin)])
     async def stop(sid: str):

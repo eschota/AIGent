@@ -19,6 +19,11 @@ class Store:
           id INTEGER PRIMARY KEY, session_id TEXT, kind TEXT, payload TEXT, created REAL);
         CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, epoch INTEGER, created REAL);
         CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE IF NOT EXISTS admin_sessions (
+          token_hash TEXT PRIMARY KEY, expires REAL NOT NULL, credential_revision TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS message_requests (
+          session_id TEXT, request_id TEXT, text_hash TEXT, created REAL,
+          PRIMARY KEY(session_id,request_id));
         CREATE TABLE IF NOT EXISTS usage (
           id INTEGER PRIMARY KEY, session_id TEXT, payload TEXT, created REAL);
         CREATE TABLE IF NOT EXISTS inbox (
@@ -28,6 +33,15 @@ class Store:
           created REAL, metadata TEXT DEFAULT '{}');
         CREATE TABLE IF NOT EXISTS projects (
           id TEXT PRIMARY KEY, name TEXT, path TEXT UNIQUE, created REAL);
+        CREATE TABLE IF NOT EXISTS queued_messages (
+          id INTEGER PRIMARY KEY, session_id TEXT, payload TEXT, created REAL,
+          status TEXT DEFAULT 'pending');
+        CREATE TABLE IF NOT EXISTS skills (
+          id TEXT PRIMARY KEY, path TEXT UNIQUE, name TEXT, title TEXT, summary TEXT,
+          source TEXT, origin TEXT, tags TEXT DEFAULT '[]', digest TEXT, bytes INTEGER,
+          modified REAL, indexed REAL, uses INTEGER DEFAULT 0, used_at REAL, analysis TEXT DEFAULT 'local');
+        CREATE INDEX IF NOT EXISTS skills_modified ON skills(modified DESC);
+        CREATE INDEX IF NOT EXISTS queue_session ON queued_messages(session_id, id);
         CREATE INDEX IF NOT EXISTS events_session ON events(session_id, id);
         CREATE INDEX IF NOT EXISTS messages_session ON messages(session_id, id);
         """)
@@ -35,7 +49,9 @@ class Store:
         for name, definition in {"provider": "TEXT DEFAULT 'deepseek'", "account_id": "TEXT DEFAULT 'deepseek-default'",
                                  "external_id": "TEXT", "model": "TEXT DEFAULT ''", "effort": "TEXT DEFAULT 'medium'",
                                  "workspace": "TEXT", "project_id": "TEXT", "archived": "INTEGER DEFAULT 0",
-                                 "pinned": "INTEGER DEFAULT 0", "forked": "INTEGER DEFAULT 0", "deleted": "INTEGER DEFAULT 0"}.items():
+                                 "pinned": "INTEGER DEFAULT 0", "forked": "INTEGER DEFAULT 0", "deleted": "INTEGER DEFAULT 0",
+                                 "auto_approve": "INTEGER DEFAULT 0",
+                                 "auto_continue": "INTEGER DEFAULT 1"}.items():
             if name not in columns:
                 self.db.execute(f"ALTER TABLE sessions ADD COLUMN {name} {definition}")
         for provider in ("deepseek", "codex", "claude"):
@@ -77,7 +93,7 @@ class Store:
         return self.rows("SELECT * FROM accounts ORDER BY created")
 
     def update_session(self, sid, **fields):
-        allowed = {"title", "provider", "account_id", "external_id", "model", "effort", "workspace", "project_id", "archived", "pinned", "forked", "deleted"}
+        allowed = {"title", "provider", "account_id", "external_id", "model", "effort", "workspace", "project_id", "archived", "pinned", "forked", "deleted", "auto_approve", "auto_continue"}
         if not fields or not set(fields) <= allowed:
             raise ValueError("Invalid session fields")
         self.execute("UPDATE sessions SET " + ",".join(f"{key}=?" for key in fields) + " WHERE id=?", (*fields.values(), sid))
@@ -111,6 +127,29 @@ class Store:
     def history(self, sid):
         return [json.loads(r["payload"]) for r in self.rows(
             "SELECT payload FROM messages WHERE session_id=? ORDER BY id", (sid,))]
+
+    def queue_message(self, sid, content):
+        """Persist a turn requested while the session was busy. Nothing is dropped or interrupted."""
+        cur = self.execute("INSERT INTO queued_messages(session_id,payload,created) VALUES (?,?,?)",
+                           (sid, json.dumps(content, ensure_ascii=False), time.time()))
+        return cur.lastrowid
+
+    def queued(self, sid=None, status="pending"):
+        sql = "SELECT * FROM queued_messages WHERE status=?" + (" AND session_id=?" if sid else "") + " ORDER BY id"
+        rows = self.rows(sql, (status, sid) if sid else (status,))
+        return [r | {"payload": json.loads(r["payload"])} for r in rows]
+
+    def take_queued(self, sid):
+        rows = self.queued(sid)
+        if not rows:
+            return None
+        self.execute("UPDATE queued_messages SET status='sent' WHERE id=?", (rows[0]["id"],))
+        return rows[0]
+
+    def drop_queued(self, sid, qid=None):
+        sql = "UPDATE queued_messages SET status='cancelled' WHERE session_id=? AND status='pending'"
+        cur = self.execute(sql + (" AND id=?" if qid else ""), (sid, qid) if qid else (sid,))
+        return cur.rowcount
 
     def add_usage(self, sid, usage):
         self.execute("INSERT INTO usage(session_id,payload,created) VALUES (?,?,?)",

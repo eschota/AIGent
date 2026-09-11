@@ -9,7 +9,7 @@ document.body.insertAdjacentHTML('beforeend', `
 <label>Проект<select id="new-chat-project"><option value="">Отдельная рабочая папка</option></select></label><label class="checkbox"><input id="new-chat-telegram" type="checkbox"> Создать топик в текущем Telegram-чате</label><p id="new-chat-account-state" class="muted"></p><button class="primary">Создать чат</button></form></dialog>
 <dialog id="accounts-dialog"><div class="section-heading"><h2>Аккаунты и лимиты</h2><button data-close="accounts-dialog">✕</button></div><p class="muted">У каждого подключения отдельная авторизация. Лимиты подписки и денежный баланс API учитываются раздельно.</p><button id="refresh-accounts">Обновить подключения</button><div id="account-rows"></div><details><summary>Добавить аккаунт</summary><form id="account-form"><div class="form-grid"><label>Провайдер<select id="account-provider"><option value="codex">OpenAI / Codex</option><option value="claude">Claude</option><option value="deepseek">DeepSeek API</option></select></label><label>Имя или email<input id="account-name" required maxlength="120"></label></div><label>Браузерный профиль<select id="account-browser"><option value="">Браузер по умолчанию</option></select></label><label id="account-key-label" hidden>API-ключ DeepSeek<input id="account-key" type="password" autocomplete="off"></label><button class="primary">Добавить подключение</button></form></details><p id="account-login-state" class="muted"></p></dialog>
 <dialog id="native-history-dialog"><div class="section-heading"><h2>Чаты локального провайдера</h2><button data-close="native-history-dialog">✕</button></div><p class="muted">Импорт создаёт отдельную ветку, чтобы сохранить исходный чат.</p><div id="native-history-list"></div></dialog>
-<dialog id="session-menu-dialog"><form id="session-menu-form"><div class="section-heading"><h2>Настройки чата</h2><button type="button" data-close="session-menu-dialog">✕</button></div><label>Название<input id="rename-title" required maxlength="100"></label><button class="primary">Сохранить название</button></form><div class="session-menu-actions"><button id="pin-chat">Закрепить / открепить</button><button id="fork-chat">Создать ветку</button><button id="archive-chat">Архивировать</button></div></dialog>
+<dialog id="session-menu-dialog"><form id="session-menu-form"><div class="section-heading"><h2>Настройки чата</h2><button type="button" data-close="session-menu-dialog">✕</button></div><label>Название<input id="rename-title" required maxlength="100"></label><label>Проект<select id="session-project-select"><option value="">Отдельная рабочая папка</option></select></label><label class="checkbox"><input id="session-auto-approve" type="checkbox"> Автоприменение: выполнять команды терминала и правки агента без подтверждения</label><label class="checkbox"><input id="session-auto-continue" type="checkbox"> Не останавливаться: продолжать ходы, пока текущая цель не достигнута</label><p class="muted" id="session-workspace-note"></p><button class="primary">Сохранить настройки чата</button></form><div class="session-menu-actions"><button id="pin-chat">Закрепить / открепить</button><button id="fork-chat">Создать ветку</button><button id="archive-chat">Архивировать</button></div></dialog>
 <dialog id="text-input-dialog"><form id="text-input-form"><div class="section-heading"><h2 id="text-input-title"></h2><button type="button" data-close="text-input-dialog">✕</button></div><label id="text-input-label">Значение<input id="text-input-value" required></label><button class="primary">Продолжить</button></form></dialog>`);
 document.querySelectorAll('[data-close]').forEach(button=>button.onclick=()=>$(button.dataset.close).close());
 
@@ -120,16 +120,30 @@ async function showNewChat(accountId){
   updateNewChatModels();$('new-chat-dialog').showModal();
 }
 async function addProject(){let folder=window.aigentDesktop?await window.aigentDesktop.chooseProject():await inputDialog('Полный путь к папке проекта');if(!folder)return;const p=await api('/api/projects',{method:'POST',body:{path:folder}});selectedProject=p.id;await refreshConnections();toast('Проект подключён: '+p.name);}
-async function showSessionMenu(){if(!current)return; $('rename-title').value=current.title;$('session-menu-dialog').showModal();}
+async function showSessionMenu(){
+  if(!current){await showNewChat();return;}
+  if(!projectsData.length)await refreshConnections();
+  $('rename-title').value=current.title;
+  $('session-project-select').replaceChildren(el('option','Отдельная рабочая папка'),...projectsData.map(p=>{const o=el('option',p.name);o.value=p.id;o.title=p.path;return o;}));
+  $('session-project-select').options[0].value='';
+  $('session-project-select').value=current.project_id||'';
+  $('session-auto-approve').checked=!!current.auto_approve;
+  $('session-auto-continue').checked=current.auto_continue!==0;
+  setText('session-workspace-note','Рабочая папка: '+(current.workspace||'отдельная папка сессии')+'. Смена проекта доступна, когда ход завершён.');
+  $('session-menu-dialog').showModal();
+}
+window.showSessionMenu=showSessionMenu;
 
 const originalSelect=selectSession;
 selectSession=async function(s){if(editorDirty){toast('Сначала сохраните открытый файл.');return;}terminalHistory.clear();$('task-plan').replaceChildren();await originalSelect(s);selectedProject=s.project_id||'';editorFile=null;editorWidget?.destroy();editorWidget=null;$('code-editor').replaceChildren(el('p','Выберите файл.','muted'));setText('editor-path','Выберите файл');$('save-file').disabled=true;renderProjects();setComposerProvider();if(!dock.hidden)await showDock(dock.dataset.active||'editor');};
 function setComposerProvider(){if(!current)return;const a=accountsData.find(a=>a.id===current.account_id);const name=current.provider==='codex'?'Codex':current.provider==='claude'?'Claude':'DeepSeek';$('composer-model').firstChild.textContent=(current.model||name)+' ';setText('thinking-label',current.provider==='deepseek'?'Thinking':current.effort||'');$('composer-model').title=a?accountLabel(a):name;}
 const originalRefresh=refresh;
-refresh=async function(){await originalRefresh();setComposerProvider();try{const questions=await api('/api/questions');renderQuestions(questions.filter(q=>q.sid===current?.id));}catch{}};
+refresh=async function(){await originalRefresh();setComposerProvider();try{const questions=await api('/api/questions');renderQuestions(questions.filter(q=>q.sid===current?.id&&!isAnsweredQuestion(q.id)));}catch{}};
+function isAnsweredQuestion(id){try{return answeredQuestionIds().has(id);}catch{return false;}}
+function rememberAnsweredQuestion(id){try{rememberAnswer(id,'');}catch{}}
 function renderQuestions(questions){
   const signature=JSON.stringify(questions);if($('pending-questions').dataset.signature===signature)return;$('pending-questions').dataset.signature=signature;
-  $('pending-questions').replaceChildren(...questions.map(q=>{const form=el('form',undefined,'approval-card');const fields=[];for(const item of q.questions){const label=el('label',item.question);const input=el('input');input.required=true;label.append(input);if(item.options)label.append(el('small',item.options.map(o=>o.label||o).join(' / ')));form.append(label);fields.push([item.id,input]);}form.append(el('button','Ответить','primary'));form.onsubmit=handle(async()=>{await api('/api/questions/'+q.id,{method:'POST',body:{answers:Object.fromEntries(fields.map(([id,input])=>[id,input.value]))}});await refresh();});return form;}));
+  $('pending-questions').replaceChildren(...questions.map(q=>{const form=el('form',undefined,'approval-card');const fields=[];for(const item of q.questions){const label=el('label',item.question);const input=el('input');input.required=true;label.append(input);if(item.options)label.append(el('small',item.options.map(o=>o.label||o).join(' / ')));form.append(label);fields.push([item.id,input]);}form.append(el('button','Ответить','primary'));form.onsubmit=handle(async()=>{await api('/api/questions/'+q.id,{method:'POST',body:{answers:Object.fromEntries(fields.map(([id,input])=>[id,input.value]))}});rememberAnsweredQuestion(q.id);await refresh();});return form;}));
 }
 const originalRenderEvent=renderEvent;
 renderEvent=function(event){
@@ -154,7 +168,15 @@ $('new-chat-form').onsubmit=handle(async()=>{const account=accountsData.find(a=>
 $('account-provider').onchange=()=>$('account-key-label').hidden=$('account-provider').value!=='deepseek';
 $('account-browser').onchange=()=>{const b=browsersData.find(b=>b.id===$('account-browser').value);if(b?.email)$('account-name').value=b.email;};
 $('account-form').onsubmit=handle(async()=>{await api('/api/accounts',{method:'POST',body:{provider:$('account-provider').value,name:$('account-name').value,browser_profile:$('account-browser').value,api_key:$('account-key').value}});$('account-key').value='';await refreshConnections();toast('Подключение добавлено. Выполните вход в нужный аккаунт.');});
-$('session-menu-form').onsubmit=handle(async()=>{current=await api('/api/sessions/'+current.id,{method:'PATCH',body:{title:$('rename-title').value}});setText('session-title',current.title);$('session-menu-dialog').close();await refresh();});
+$('session-menu-form').onsubmit=handle(async()=>{
+  const body={title:$('rename-title').value,auto_approve:$('session-auto-approve').checked,
+              auto_continue:$('session-auto-continue').checked};
+  if(($('session-project-select').value||'')!==(current.project_id||''))body.project_id=$('session-project-select').value;
+  current=await api('/api/sessions/'+current.id,{method:'PATCH',body});
+  setText('session-title',current.title);selectedProject=current.project_id||'';
+  $('session-menu-dialog').close();await loadProjects();await refresh();renderProjects();
+  toast(current.workspace?'Чат работает в проекте: '+current.workspace:'Чат работает в отдельной папке сессии');
+});
 $('pin-chat').onclick=handle(async()=>{await api('/api/sessions/'+current.id,{method:'PATCH',body:{pinned:!current.pinned}});$('session-menu-dialog').close();await refresh();});
 $('archive-chat').onclick=handle(async()=>{await api('/api/sessions/'+current.id,{method:'PATCH',body:{archived:true}});$('session-menu-dialog').close();current=null;source?.close();$('events').replaceChildren();setText('session-title','Новый чат');await refresh();});
 $('fork-chat').onclick=handle(async()=>{const s=await api(`/api/sessions/${current.id}/fork`,{method:'POST'});$('session-menu-dialog').close();await selectSession(s);});
@@ -165,7 +187,7 @@ $('create-file').onclick=handle(async()=>{const name=await inputDialog('Путь
 $('git-commit-form').onsubmit=handle(async()=>{const r=await api(`/api/sessions/${current.id}/git`,{method:'POST',body:{action:'commit',message:$('commit-message').value}});toast(r.result);$('commit-message').value='';await loadGit();});
 $('terminal-form').onsubmit=handle(async()=>{if(!current)return;const command=$('terminal-command').value.trim();if(!command)return;ensureTerminal();const r=await api(`/api/sessions/${current.id}/terminal`,{method:'POST',body:{command}});terminalId=r.id;terminalSession=current.id;terminalWidget.write(terminalHistory.get(r.id)||'');$('terminal-command').value='';});
 $('terminal-stop').onclick=handle(async()=>{if(terminalId)await api(`/api/sessions/${terminalSession}/terminal/${terminalId}/stop`,{method:'POST'});});
-$('composer').onsubmit=handle(async()=>{const text=$('message').value.trim();if(!text)return;if(!current){await showNewChat();return;}const busy=['running','approval'].includes(current.status);await api(`/api/sessions/${current.id}/${busy&&current.provider==='codex'?'steer':'messages'}`,{method:'POST',body:{text}});$('message').value='';await refresh();});
+$('composer').onsubmit=handle(async()=>{if(!current){await showNewChat();return;}await submitMessage();});
 document.addEventListener('keydown',event=>{if((event.ctrlKey||event.metaKey)&&event.key.toLowerCase()==='s'&&editorFile){event.preventDefault();saveEditor().catch(e=>toast(e.message));}});
 document.addEventListener('keydown',event=>{if((event.ctrlKey||event.metaKey)&&event.key.toLowerCase()==='p'&&!document.querySelector('dialog[open]')){event.preventDefault();(async()=>{if(!current)return toast('Сначала выберите чат');const file=await inputDialog('Открыть файл проекта');if(file){await showDock('editor');await openEditor(file);editorWidget?.focus();}})().catch(e=>toast(e.message));}},true);
 window.aigentDesktop?.onAction(action=>{if(action==='new-chat')showNewChat().catch(e=>toast(e.message));if(action==='open-project')addProject().catch(e=>toast(e.message));});

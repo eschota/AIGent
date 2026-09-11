@@ -228,3 +228,35 @@ async def test_nested_workspace_cannot_modify_parent_git_repository(service):
     agent.store.update_session(session['id'], workspace=str(child))
     with pytest.raises(ValueError, match='Git'):
         await workspace.git(session['id'], ['status', '--porcelain'])
+
+
+def test_admin_cookie_survives_restart_and_password_change_revokes_it(tmp_path):
+    root = tmp_path / 'state'
+    first = create_app(root, polling=False)
+    first.state.config.values['admin_password'] = password_hash('restart-password')
+    first.state.config.save()
+    with TestClient(first) as client:
+        assert client.post('/api/login', json={'password':'restart-password'}).status_code == 200
+        cookie = client.cookies['ide_admin']
+        stored = first.state.store.rows('SELECT * FROM admin_sessions')
+        assert cookie not in str(stored)
+    second = create_app(root, polling=False)
+    with TestClient(second) as client:
+        client.cookies.set('ide_admin', cookie)
+        assert client.get('/api/sessions').status_code == 200
+        second.state.config.values['admin_password'] = password_hash('changed-password')
+        assert client.get('/api/sessions').status_code == 401
+
+
+def test_retried_message_is_started_once(tmp_path):
+    from unittest.mock import Mock
+    app = create_app(tmp_path / 'state', polling=False)
+    with TestClient(app) as client:
+        client.headers['Authorization'] = 'Bearer ' + app.state.config['connector_token']
+        sid = client.post('/api/sessions', json={'title':'Retry fixture'}).json()['id']
+        app.state.agent.start = Mock()
+        body = {'text':'Do this once', 'request_id':'retry-fixture-1'}
+        assert client.post(f'/api/sessions/{sid}/messages', json=body).status_code == 202
+        assert client.post(f'/api/sessions/{sid}/messages', json=body).json()['duplicate']
+        assert app.state.agent.start.call_count == 1
+        assert client.post(f'/api/sessions/{sid}/messages', json=body | {'text':'Different'}).status_code == 409

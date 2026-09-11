@@ -1,9 +1,11 @@
-const {app,BrowserWindow,ipcMain,dialog,shell,Menu,session,nativeTheme} = require('electron');
+const {app,BrowserWindow,ipcMain,dialog,shell,Menu,session,nativeTheme,clipboard,nativeImage} = require('electron');
 const path=require('node:path');
 const fs=require('node:fs');
 const os=require('node:os');
 const crypto=require('node:crypto');
 const {spawn}=require('node:child_process');
+const {registerWindows,savedDataDirectory}=require('./windows-integration.cjs');
+const {requestStatus,portableMode,pickAsset,stage}=require('./updates.cjs');
 const {zoomAction}=require(app.isPackaged?'./shared/zoom.js':'../connector/static/zoom.js');
 app.commandLine.appendSwitch('force-renderer-accessibility');
 
@@ -15,7 +17,9 @@ function projectRoot(){
   return initial;
 }
 const project=projectRoot();
-const data=path.join(project,'.local');
+const dataArgument=process.argv.indexOf('--data-dir');
+const explicitData=dataArgument>=0?process.argv[dataArgument+1]:null;
+const data=path.resolve(explicitData||savedDataDirectory()||(fs.existsSync(path.join(project,'run.py'))?path.join(project,'.local'):path.join(process.env.LOCALAPPDATA||project,'AIGent','.local')));
 fs.mkdirSync(path.join(data,'electron-profile'),{recursive:true});
 app.setPath('userData',path.join(data,'electron-profile'));
 app.setPath('sessionData',path.join(data,'electron-profile','session'));
@@ -26,7 +30,7 @@ process.env.TEMP=path.join(data,'tmp');process.env.TMP=process.env.TEMP;
 fs.mkdirSync(process.env.TEMP,{recursive:true});
 const origin='http://127.0.0.1:8787';
 let win, backend;
-if(!app.requestSingleInstanceLock()){app.quit();}
+if(!process.argv.includes('--register-only')&&!app.requestSingleInstanceLock()){app.quit();}
 app.on('second-instance',()=>{if(win){if(win.isMinimized())win.restore();win.show();win.focus();}});
 
 function config(){try{return JSON.parse(fs.readFileSync(path.join(data,'config.json'),'utf8'));}catch{return null;}}
@@ -45,7 +49,7 @@ async function ensureBackend(){
   if(await verifyServer())return;
   let executable,args;
   if(app.isPackaged){executable=path.join(process.resourcesPath,'backend','AIGentServer.exe');args=['--no-browser','--data-dir',data];}
-  else{executable=path.join(project,'.venv','Scripts','python.exe');if(process.platform!=='win32')executable=path.join(project,'.venv','bin','python');args=[path.join(project,'run.py'),'--no-browser','--data-dir',data];}
+  else{executable=path.join(project,'.venv','Scripts','python.exe');if(process.platform!=='win32')executable=path.join(project,'.venv','bin','python');args=[path.join(project,'run.py'),'--supervise','--no-browser','--data-dir',data];}
   const out=fs.openSync(path.join(data,'desktop-server.log'),'a');
   backend=spawn(executable,args,{cwd:project,windowsHide:true,stdio:['ignore',out,out],env:{...process.env,TEMP:process.env.TEMP,TMP:process.env.TEMP}});
   backend.on('error',()=>{});fs.closeSync(out);
@@ -79,6 +83,39 @@ ipcMain.handle('aigent:choose-project',async(event)=>{validateSender(event);cons
 ipcMain.handle('aigent:browser-profiles',event=>{validateSender(event);return browserProfiles().map(({exe,...metadata})=>metadata);});
 ipcMain.handle('aigent:open-auth',async(event,{url,profile})=>{validateSender(event);url=safeExternal(url,true);const b=browserProfiles().find(x=>x.id===profile);if(b){const child=spawn(b.exe,['--profile-directory='+b.directory,url],{detached:true,windowsHide:true,stdio:'ignore'});child.unref();}else await shell.openExternal(url);return {opened:true};});
 ipcMain.handle('aigent:info',event=>{validateSender(event);return {name:'AIGent',version:app.getVersion(),platform:process.platform,project};});
+const updateDirectory=path.join(data,'update');
+let staged=null;
+async function checkUpdates(force=false){
+  const c=config();
+  const result=await requestStatus({origin:origin,token:c?.connector_token,force});
+  return result.ok?result.status:{current:app.getVersion(),latest:'',update_available:false,assets:[],installer:null,page:'',notes:'',published:'',error:result.error,channel:''};
+}
+ipcMain.handle('aigent:update-status',async(event,{force}={})=>{validateSender(event);return checkUpdates(Boolean(force));});
+ipcMain.handle('aigent:update-download',async(event)=>{
+  validateSender(event);
+  const status=await checkUpdates(true);
+  const kind=portableMode()?'portable':'installer';
+  const asset=kind==='portable'?(pickAsset(status.assets,'portable')||status.installer):status.installer;
+  if(!asset)throw new Error('Release has no file for this build: '+(status.latest||'unknown version'));
+  staged=await stage({asset,directory:updateDirectory,onProgress:progress=>{if(win)win.webContents.send('aigent:update-progress',{progress});}});
+  return {version:status.latest,kind,path:staged.path,bytes:staged.bytes,verified:staged.verified};
+});
+ipcMain.handle('aigent:update-install',async(event)=>{
+  validateSender(event);
+  if(!staged||!fs.existsSync(staged.path))throw new Error('Сначала скачайте обновление');
+  if(portableMode()){
+    shell.showItemInFolder(staged.path);
+    return {action:'replace',path:staged.path};
+  }
+  const answer=await dialog.showMessageBox(win,{type:'question',title:'Обновление AIGent',buttons:['Установить и закрыть','Позже'],cancelId:1,defaultId:0,
+    message:'Установить AIGent '+path.basename(staged.path)+'?',detail:'AIGent закроется, установщик продолжит работу.'});
+  if(answer.response!==0)return {action:'cancelled'};
+  const error=await shell.openPath(staged.path);
+  if(error)throw new Error(error);
+  setTimeout(()=>app.quit(),1500);
+  return {action:'installing'};
+});
+ipcMain.handle('aigent:reauthenticate',async event=>{validateSender(event);await authenticate();return {authenticated:true};});
 function changeZoom(action){
   if(!['get','in','out','reset'].includes(action))throw new Error('Unknown zoom action');
   const before=win.webContents.getZoomFactor();
@@ -87,24 +124,50 @@ function changeZoom(action){
   win.webContents.setZoomFactor(value);win.webContents.send('aigent:zoom',value);return value;
 }
 ipcMain.handle('aigent:zoom',(event,action)=>{validateSender(event);return changeZoom(action);});
+ipcMain.handle('aigent:copy-image',(event,dataUrl)=>{
+  validateSender(event);
+  if(typeof dataUrl!=='string'||!dataUrl.startsWith('data:image/'))throw new Error('Ожидается data:image URL');
+  const image=nativeImage.createFromDataURL(dataUrl);
+  if(image.isEmpty())throw new Error('Изображение не распознано');
+  clipboard.writeImage(image);
+  return {copied:true,size:image.getSize()};
+});
+ipcMain.handle('aigent:copy-file',(event,{path:target,name}={})=>{
+  validateSender(event);
+  if(typeof target!=='string'||!target)throw new Error('Нужен путь к файлу');
+  const resolved=path.resolve(target);
+  if(!fs.existsSync(resolved))throw new Error('Файл не найден');
+  // Windows explorers read CF_HDROP-like FileNameW; the path as text is the portable fallback.
+  const payload={text:resolved};
+  if(process.platform==='win32')payload['FileNameW']=Buffer.from(resolved+'\u0000','ucs2');
+  clipboard.write(payload);
+  return {copied:true,path:resolved,name:name||path.basename(resolved)};
+});
 
 app.whenReady().then(async()=>{
   nativeTheme.themeSource='dark';
+  try{const registration=registerWindows({app,shell,dataDirectory:data});if(process.argv.includes('--register-only')){console.log(JSON.stringify(registration));app.quit();return;}}
+  catch(error){if(process.argv.includes('--register-only'))throw error;fs.appendFileSync(path.join(data,'desktop-integration.log'),error.message+'\n');}
   await ensureBackend();await authenticate();
   win=new BrowserWindow({width:1440,height:960,minWidth:800,minHeight:600,title:'AIGent',icon:path.join(__dirname,'assets','icon.png'),backgroundColor:'#181818',show:false,
     webPreferences:{preload:path.join(__dirname,'preload.cjs'),contextIsolation:true,nodeIntegration:false,sandbox:true}});
   win.webContents.setWindowOpenHandler(({url})=>{try{shell.openExternal(safeExternal(url));}catch{}return {action:'deny'};});
   win.webContents.on('will-navigate',(event,url)=>{if(!url.startsWith(origin+'/')){event.preventDefault();try{shell.openExternal(safeExternal(url));}catch{}}});
-  win.webContents.session.setPermissionRequestHandler((_contents,_permission,callback)=>callback(false));
+  // Writing to the clipboard is a user action inside our own window; everything else stays denied.
+  const allowed=new Set(['clipboard-sanitized-write','clipboard-write']);
+  win.webContents.session.setPermissionRequestHandler((_contents,permission,callback)=>callback(allowed.has(permission)));
+  win.webContents.session.setPermissionCheckHandler((_contents,permission)=>allowed.has(permission));
   win.webContents.on('before-input-event',(event,input)=>{if(input.type!=='keyDown')return;const action=zoomAction(input);if(action){event.preventDefault();changeZoom(action);}});
   Menu.setApplicationMenu(Menu.buildFromTemplate([
     {label:'Файл',submenu:[{label:'Новый чат',accelerator:'CmdOrCtrl+N',click:()=>win.webContents.send('aigent:action','new-chat')},{label:'Открыть проект…',accelerator:'CmdOrCtrl+O',click:()=>win.webContents.send('aigent:action','open-project')},{type:'separator'},{role:'quit',label:'Выйти'}]},
     {label:'Правка',submenu:[{role:'undo',label:'Отменить'},{role:'redo',label:'Повторить'},{type:'separator'},{role:'cut',label:'Вырезать'},{role:'copy',label:'Копировать'},{role:'paste',label:'Вставить'},{role:'selectAll',label:'Выделить всё'}]},
     {label:'Вид',submenu:[{role:'reload',label:'Обновить'},{role:'toggleDevTools',label:'Инструменты разработчика'},{label:'Обычный размер',accelerator:'CmdOrCtrl+0',click:()=>changeZoom('reset')},{label:'Увеличить',accelerator:'CmdOrCtrl+Plus',click:()=>changeZoom('in')},{label:'Уменьшить',accelerator:'CmdOrCtrl+-',click:()=>changeZoom('out')},{role:'togglefullscreen',label:'Полный экран'}]},
-    {label:'Справка',submenu:[{label:'GitHub',click:()=>shell.openExternal('https://github.com/eschota/AIGent')},{label:'Версия '+app.getVersion(),enabled:false}]}
+    {label:'Справка',submenu:[{label:'Проверить обновления…',click:()=>{win.webContents.send('aigent:action','check-updates');checkUpdates(true).then(status=>{if(status.update_available)win.webContents.send('aigent:update',status);}).catch(()=>{});}},{label:'Открыть папку обновлений',click:()=>{fs.mkdirSync(updateDirectory,{recursive:true});shell.openPath(updateDirectory);}},{type:'separator'},{label:'GitHub',click:()=>shell.openExternal('https://github.com/eschota/AIGent')},{label:'Версия '+app.getVersion(),enabled:false}]}
   ]));
   let url=origin+'/';const c=config();if(c&&!c.admin_password)url+='#setup='+encodeURIComponent(c.setup_token);
   await win.loadURL(url);win.show();
+  // Automatic check respects the saved setting; a failure stays silent and is visible in Settings.
+  if(config()?.auto_update_check!==false)setTimeout(()=>{checkUpdates(false).then(status=>{if(status.update_available&&win)win.webContents.send('aigent:update',status);}).catch(()=>{});},4000).unref();
   setInterval(()=>authenticate().catch(()=>{}),60*60*1000).unref();
 }).catch(error=>{dialog.showErrorBox('AIGent',error.message);app.quit();});
 app.on('window-all-closed',()=>app.quit());

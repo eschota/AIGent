@@ -1,6 +1,6 @@
 {
   "name": "aigent-desktop",
-  "version": "0.2.0",
+  "version": "0.5.0",
   "description": "AIGent desktop - Codex, Claude and DeepSeek in one local agent workspace",
   "author": "AIGent contributors",
   "license": "MIT",
@@ -9,7 +9,7 @@
     "test": "node --test ui.test.cjs",
     "start": "electron .",
     "pack": "electron-builder --win --dir",
-    "dist": "electron-builder --win portable",
+    "dist": "electron-builder --win nsis portable",
     "build:ui": "esbuild ui-entry.js --bundle --minify --format=iife --outfile=../connector/static/widgets.js --legal-comments=linked",
     "install:electron": "install-electron"
   },
@@ -36,6 +36,7 @@
     },
     "files": [
       "main.cjs",
+      "windows-integration.cjs",
       "preload.cjs",
       "package.json",
       "assets/*",
@@ -58,12 +59,22 @@
       }
     ],
     "win": {
-      "target": "portable",
-      "signAndEditExecutable": false,
+      "target": ["nsis", "portable"],
+      "signExecutable": false,
       "icon": "assets/icon.ico"
     },
     "portable": {
       "artifactName": "AIGent-${version}-portable.exe"
+    },
+    "nsis": {
+      "artifactName": "AIGent-Setup-${version}.exe",
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createStartMenuShortcut": true,
+      "createDesktopShortcut": false,
+      "shortcutName": "AIGent",
+      "deleteAppDataOnUninstall": false
     }
   }
 }

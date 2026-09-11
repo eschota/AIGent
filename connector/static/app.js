@@ -9,11 +9,220 @@ $('pending-actions').append($('approvals'));
 $('usage-panel').append(document.querySelector('.inspector'));
 document.querySelector('.composer-footer').append($('stop-button'));
 $('stop-button').hidden=true;
+let attachments=[], projectIndex={}, uiRevision='', uiReloadOffered=false, lastRollback='';
+const attachStrip=el('div',undefined,'composer-attachments');attachStrip.id='composer-attachments';attachStrip.hidden=true;$('message').before(attachStrip);
+const queueStrip=el('div',undefined,'queued-messages');queueStrip.id='queued-messages';queueStrip.hidden=true;$('composer').before(queueStrip);
+const goalBanner=el('div',undefined,'goal-banner');goalBanner.id='goal-banner';goalBanner.hidden=true;$('composer').before(goalBanner);
+const activityBar=el('div',undefined,'activity-bar');activityBar.id='activity-bar';activityBar.hidden=true;$('composer').before(activityBar);
+let activity={since:0,label:'',detail:'',tasks:new Map()},activityTimer=null;
+const elapsed=(from)=>{const s=Math.max(0,Math.round((Date.now()-from)/1000));return s<60?s+' с':Math.floor(s/60)+' мин '+String(s%60).padStart(2,'0')+' с';};
+function renderActivity(){
+  const running=activity.since>0;
+  const tasks=[...activity.tasks.values()];
+  activityBar.hidden=!running&&!tasks.length;
+  if(activityBar.hidden)return;
+  activityBar.replaceChildren();
+  if(running){
+    const row=el('div',undefined,'activity-row');
+    row.append(el('span',undefined,'activity-spinner'),
+               el('span',(activity.icon||'⚙️')+' '+shorten(activity.label||'Работает',26),'activity-label'));
+    if(activity.detail)row.append(el('span',shorten(activity.detail,28),'activity-detail'));
+    row.append(el('span',elapsed(activity.since),'activity-time'));
+    row.title=(activity.label||'')+(activity.detail?' · '+activity.detail:'');
+    activityBar.append(row);
+  }
+  for(const task of tasks){
+    const row=el('div',undefined,'activity-row background');
+    row.append(el('span',undefined,'activity-spinner farm'),
+               el('span',(task.icon||'🎬')+' '+shorten(task.label,24),'activity-label'));
+    if(task.detail)row.append(el('span',shorten(task.detail,16),'activity-detail'));
+    row.append(el('span',elapsed(task.since),'activity-time'));
+    activityBar.append(row);
+  }
+}
+function startActivity(label,detail,icon){
+  if(!activity.since)activity.since=Date.now();
+  if(label)activity.label=label;
+  if(detail!==undefined)activity.detail=detail;
+  if(icon)activity.icon=icon;
+  renderActivity();
+  clearInterval(activityTimer);activityTimer=setInterval(renderActivity,1000);
+}
+function stopActivity(){
+  activity.since=0;activity.label='';activity.detail='';activity.icon='';
+  renderActivity();
+  if(!activity.tasks.size){clearInterval(activityTimer);activityTimer=null;}
+}
+function trackTask(id,label,detail,done){
+  if(done)activity.tasks.delete(id);
+  else if(activity.tasks.has(id)){const item=activity.tasks.get(id);item.label=label||item.label;item.detail=detail??item.detail;}
+  else activity.tasks.set(id,{since:Date.now(),label,detail,icon:String(label).includes('видео')?'🎞️':'🎨'});
+  renderActivity();
+  if(activity.tasks.size&&!activityTimer)activityTimer=setInterval(renderActivity,1000);
+}
+const questionStrip=el('div',undefined,'background-questions');questionStrip.id='background-questions';questionStrip.hidden=true;$('composer').before(questionStrip);
+document.body.insertAdjacentHTML('beforeend','<dialog id="media-viewer"><div class="media-viewer-head"><span id="media-name"></span><span class="media-viewer-actions"><button type="button" id="media-copy">Копировать</button><a id="media-download">Скачать</a><button type="button" id="media-close">✕</button></span></div><div id="media-stage"></div></dialog>');
+$('media-close').onclick=()=>$('media-viewer').close();
+$('media-viewer').addEventListener('click',event=>{if(event.target===$('media-viewer'))$('media-viewer').close();});
+const autoToggle=el('label',undefined,'auto-approve-toggle checkbox');autoToggle.title='Автоматически применять все правки и команды терминала этой сессии без подтверждения';
+const autoInput=el('input');autoInput.type='checkbox';autoInput.id='auto-approve';autoToggle.append(autoInput,el('span','Авто'));
+document.querySelector('.composer-footer').prepend(autoToggle);
+const contextMeter=el('button',undefined,'context-meter');contextMeter.id='context-meter';contextMeter.type='button';contextMeter.hidden=true;
+const contextBar=el('span',undefined,'context-bar'),contextFill=el('i'),contextValue=el('span','—','context-value');
+contextBar.append(contextFill);contextMeter.append(contextBar,contextValue);
+$('composer-model').after(contextMeter);
+contextMeter.onclick=handle(()=>showSettings());
+const compact=(n)=>n>=1e6?(n/1e6).toFixed(1)+'M':n>=1e3?(n/1e3).toFixed(1)+'k':String(n);
+function renderContext(data){
+  if(!data){contextMeter.hidden=true;return;}
+  contextMeter.hidden=false;
+  const percent=Math.min(100,Math.max(0,data.percent));
+  contextFill.style.width=percent+'%';
+  contextValue.textContent=Math.round(percent)+'%';
+  contextMeter.classList.toggle('warn',percent>=60&&percent<85);
+  contextMeter.classList.toggle('full',percent>=85);
+  contextMeter.title=`Контекст ${compact(data.chars)} / ${compact(data.limit)} символов (${percent}%)`
+    +`\n${data.messages} сообщений${data.images?' · '+data.images+' с изображениями':''}`
+    +'\nПри переполнении самые старые ходы исключаются из контекста; история чата сохраняется.';
+}
+async function loadContext(){
+  if(!current){renderContext(null);return;}
+  try{renderContext(await api(`/api/sessions/${current.id}/context`));}catch{}
+}
 function toast(message) { $('toast').textContent = message; $('toast').hidden = false; clearTimeout(toast.timer); toast.timer = setTimeout(() => $('toast').hidden = true, 6000); }
+let authRecovery=null;
+async function recoverAuthentication(){
+  if(authRecovery)return authRecovery;
+  authRecovery=(async()=>{
+    if(window.aigentDesktop?.reauthenticate){await window.aigentDesktop.reauthenticate();return;}
+    await new Promise((resolve,reject)=>{
+      const dialog=el('dialog');dialog.innerHTML='<form><h2>Восстановить вход</h2><p>Черновик сохранён. Войдите повторно, и отправка продолжится.</p><label>Пароль администратора<input type="password" autocomplete="current-password" required></label><p class="auth-error"></p><button class="primary">Войти и продолжить</button></form>';
+      dialog.querySelector('form').onsubmit=async e=>{e.preventDefault();try{const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json','X-Requested-With':'DeepSeekIDE'},body:JSON.stringify({password:dialog.querySelector('input').value})});if(!r.ok)throw new Error('Не удалось войти. Проверьте пароль.');dialog.remove();resolve();}catch(error){dialog.querySelector('.auth-error').textContent=error.message;}};
+      dialog.addEventListener('cancel',()=>{dialog.remove();reject(new Error('Отправка отменена; черновик сохранён'));},{once:true});document.body.append(dialog);dialog.showModal();
+    });
+  })().finally(()=>{authRecovery=null;});
+  return authRecovery;
+}
+function dropAttachment(item){
+  if(item.preview&&URL.revokeObjectURL)URL.revokeObjectURL(item.preview);
+  attachments=attachments.filter(x=>x!==item);renderAttachments();
+}
+function renderAttachments(){
+  $('composer-attachments').hidden=!attachments.length;
+  $('composer-attachments').replaceChildren(...attachments.map(item=>{
+    const chip=el('div',undefined,'attachment-chip'+(item.preview?' visual':''));
+    if(item.preview){
+      const img=el('img');img.alt=item.name;img.decoding='async';
+      // Local object URL: the preview appears immediately and never depends on a server round trip.
+      img.src=item.preview;
+      img.onerror=()=>{img.src=`/api/sessions/${item.sid}/image?path=${encodeURIComponent(item.path)}`;};
+      chip.append(img);
+    }
+    const meta=el('div',undefined,'attachment-meta');
+    meta.append(el('span',item.name),el('small',(item.bytes>1048576?(item.bytes/1048576).toFixed(1)+' MB':Math.max(1,Math.round(item.bytes/1024))+' KB')));
+    chip.append(meta);
+    const remove=el('button','✕');remove.type='button';remove.title='Открепить от сообщения';
+    remove.onclick=()=>dropAttachment(item);
+    chip.append(remove);return chip;
+  }));
+}
+async function uploadAttachment(file){
+  if(!current)await createSession();
+  const body=new FormData();
+  body.set('file',file,file.name||('clipboard-'+Date.now()+(file.type==='image/png'?'.png':'')));
+  body.set('kind',/^image\//.test(file.type)?'photo':'document');
+  body.set('caption','');body.set('send_telegram','false');body.set('ask_agent','false');
+  const data=await api(`/api/sessions/${current.id}/files`,{method:'POST',body});
+  attachments.push({path:data.path,type:file.type||'application/octet-stream',bytes:data.bytes,sid:current.id,
+                    name:(file.name||data.path).replace(/^[0-9a-f]{8}-/,'').slice(0,40),
+                    preview:/^image\//.test(file.type)&&typeof URL.createObjectURL==='function'?URL.createObjectURL(file):''});
+  renderAttachments();return data;
+}
+async function acceptFiles(files){
+  const list=[...files].filter(Boolean);
+  if(!list.length)return false;
+  for(const file of list){
+    if(file.size>50*1024*1024){toast('Файл больше 50 MB: '+file.name);continue;}
+    toast('Загрузка вложения: '+(file.name||'изображение')+'…');
+    try{const data=await uploadAttachment(file);toast('Вложение добавлено: '+data.path.replace(/^[0-9a-f]{8}-/,'')+' · отправится со следующим сообщением');}
+    catch(error){toast('Не удалось прикрепить: '+error.message);}
+  }
+  return true;
+}
+function clipboardFiles(event){
+  const data=event.clipboardData;
+  if(!data)return [];
+  const direct=data.files?[...data.files]:[];
+  const items=[...(data.items||[])].filter(item=>item.kind==='file').map(item=>item.getAsFile());
+  return [...direct,...items].filter(Boolean).filter((file,index,all)=>all.findIndex(x=>x.name===file.name&&x.size===file.size)===index);
+}
+function pasteTarget(event){
+  // Accept a clipboard image from the composer or anywhere in the chat, but never from the code editor.
+  const node=event.target;
+  if(node?.closest?.('.developer-dock, dialog'))return false;
+  return $('workspace') && !$('workspace').hidden;
+}
+async function pasteHandler(event){
+  if(!pasteTarget(event))return;
+  const files=clipboardFiles(event);
+  if(!files.length)return;
+  event.preventDefault();
+  await acceptFiles(files);
+  $('message').focus();
+}
+$('message').addEventListener('paste',pasteHandler);
+document.addEventListener('paste',event=>{if(event.target!==$('message'))pasteHandler(event);});
+const filePicker=el('input');filePicker.type='file';filePicker.multiple=true;filePicker.hidden=true;filePicker.id='composer-file-picker';
+document.body.append(filePicker);
+filePicker.onchange=handle(async()=>{const files=[...filePicker.files];filePicker.value='';await acceptFiles(files);});
+for(const name of ['dragover','drop'])$('composer').addEventListener(name,event=>{
+  if(!event.dataTransfer?.types?.includes('Files'))return;
+  event.preventDefault();
+  $('composer').classList.toggle('dropping',name==='dragover');
+  if(name==='drop')acceptFiles(event.dataTransfer.files);
+});
+$('composer').addEventListener('dragleave',()=>$('composer').classList.remove('dropping'));
+async function loadQueue(){
+  if(!current){$('queued-messages').hidden=true;return;}
+  let items=[];
+  try{items=await api(`/api/sessions/${current.id}/queue`);}catch{return;}
+  $('queued-messages').hidden=!items.length;
+  $('queued-messages').replaceChildren(...items.map((item,index)=>{
+    const row=el('div',undefined,'queued-item');
+    row.append(el('span','В очереди '+(index+1),'queued-index'),el('pre',(item.text||'').slice(0,400)));
+    const cancel=el('button','Отменить');cancel.type='button';
+    cancel.onclick=handle(async()=>{await api(`/api/sessions/${current.id}/queue?item=${item.id}`,{method:'DELETE'});await loadQueue();});
+    row.append(cancel);return row;
+  }));
+}
+async function loadProjects(){
+  try{const list=await api('/api/projects');projectIndex=Object.fromEntries(list.map(p=>[p.id,p]));}catch{}
+}
+function saveDraft(){try{const key='aigent.draft.'+(current?.id||'new');if($('message').value)localStorage.setItem(key,$('message').value);else localStorage.removeItem(key);}catch{}}
+$('message').addEventListener('input',saveDraft);
+async function submitMessage(){
+  const pending=attachments.filter(item=>item.sid===current?.id);
+  const text=$('message').value.trim()||(pending.length?'Вложение из буфера обмена. Посмотри его и продолжи задачу.':'');
+  if(!text||!current)return;
+  const sid=current.id,original=$('message').value;saveDraft();
+  const busy=['running','approval'].includes(current.status);
+  const method=busy&&current.provider==='codex'?'steer':'messages';
+  let request_id=crypto.randomUUID();
+  try{const previous=JSON.parse(localStorage.getItem('aigent.pending.'+sid)||'null');if(previous?.text===text)request_id=previous.id;localStorage.setItem('aigent.pending.'+sid,JSON.stringify({id:request_id,text}));}catch{}
+  const result=await api(`/api/sessions/${sid}/${method}`,{method:'POST',body:{text,request_id,attachments:pending.map(item=>item.path)}});
+  for(const item of pending)if(item.preview&&URL.revokeObjectURL)URL.revokeObjectURL(item.preview);
+  attachments=attachments.filter(item=>item.sid!==sid);renderAttachments();
+  if(result?.queued)toast(`Агент занят. Сообщение №${result.position} в очереди — текущий ход не прерван.`);
+  try{localStorage.removeItem('aigent.pending.'+sid);if(current?.id!==sid||$('message').value===original)localStorage.removeItem('aigent.draft.'+sid);}catch{}
+  if(current?.id===sid&&$('message').value===original)$('message').value='';
+  await refresh();
+}
 async function api(path, options = {}) {
   const headers = {'X-Requested-With': 'DeepSeekIDE', ...(options.headers || {})};
   if (options.body && !(options.body instanceof FormData)) {headers['Content-Type'] = 'application/json'; options.body = JSON.stringify(options.body);}
-  const response = await fetch(path, {...options, headers});
+  const request={...options,headers};
+  let response = await fetch(path, request);
+  if(response.status===401&&!['/api/login','/api/logout'].includes(path)&&!$('workspace').hidden){saveDraft();await recoverAuthentication();response=await fetch(path,request);}
   const data = await response.json().catch(() => ({detail: response.statusText}));
   if (!response.ok) throw new Error(typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail));
   return data;
@@ -55,6 +264,17 @@ async function refresh() {
   $('bot-status').classList.toggle('error', status.bot === 'error');
   $('bot-status').title = status.error || '';
   setText('model-label', status.model); setText('session-count', sessions.length);
+  if(status.supervisor?.state==='rolled_back'&&status.supervisor.restored!==lastRollback){
+    lastRollback=status.supervisor.restored;
+    toast('Сервер откатился на последнюю рабочую версию кода ('+lastRollback+') после неудачной правки.');
+  }
+  if(!uiRevision)uiRevision=status.ui_revision||'';
+  else if(status.ui_revision&&status.ui_revision!==uiRevision&&!uiReloadOffered){
+    uiReloadOffered=true;
+    toast('Интерфейс обновлён на сервере. Перезагрузите страницу, чтобы получить новые возможности.');
+    const button=el('button','Перезагрузить');button.onclick=()=>location.reload();$('toast').append(button);
+    clearTimeout(toast.timer);
+  }
   const u = status.usage;
   setText('total-tokens', fmt(u.prompt_tokens + u.completion_tokens));
   setText('request-count', fmt(u.requests) + ' запросов');
@@ -76,7 +296,14 @@ async function refresh() {
   const selected = sessions.find(s => s.id === current?.id);
   if (selected) {current = selected; updateSessionStats(selected.usage);}
   const busy = selected && ['running','approval'].includes(selected.status);
-  $('stop-button').hidden=!busy; document.querySelector('.send-button').hidden=!!busy;
+  const send=document.querySelector('.send-button');
+  $('stop-button').hidden=!busy; send.hidden=false; send.classList.toggle('queueing',!!busy);
+  send.title=busy?'Агент занят — сообщение встанет в очередь и не прервёт ход':'Отправить';
+  $('message').placeholder=busy?'Сообщение уйдёт в очередь и будет обработано после текущего ответа':'Поручите что угодно';
+  $('auto-approve').checked=!!selected?.auto_approve;
+  autoToggle.classList.toggle('on',!!selected?.auto_approve);
+  await loadQueue();
+  await loadContext();
   renderApprovals(approvals.filter(a => a.sid === current?.id));
 }
 function updateSessionStats(u) {
@@ -84,10 +311,19 @@ function updateSessionStats(u) {
   setText('session-cache', fmt(u.cache_hit_tokens) + ' · ' + u.cache_hit_percent.toFixed(1) + '%');
   setText('session-cost', money(u.cost_usd) + (u.unpriced_requests ? ' + ?' : ''));
   setText('session-saved', money(u.saved_usd));
-  setText('session-info', `${current.id}\n${current.chat_id ? 'Telegram topic ' + current.topic_id : 'Локальная сессия'} · ${current.status}`);
+  const project=current.project_id?projectIndex[current.project_id]:null;
+  setText('session-info', `${current.id}\n${current.chat_id ? 'Telegram topic ' + current.topic_id : 'Локальная сессия'} · ${current.status}`
+    + `\nПроект: ${project?project.name+' · '+project.path:(current.workspace||'отдельная папка сессии')}`);
+  const chip=$('session-project');
+  if(chip){chip.textContent='▱ '+(project?project.name:'Без проекта');chip.title=project?project.path:'Выбрать проект для этой сессии';chip.classList.toggle('none',!project);}
 }
 async function selectSession(session) {
+  if(current||$('message').value)saveDraft();
+  for(const item of attachments)if(item.preview&&URL.revokeObjectURL)URL.revokeObjectURL(item.preview);
+  attachments=[];renderAttachments();
+  renderGoal(null);$('background-questions').replaceChildren();$('background-questions').hidden=true;
   if (source) source.close(); current = session; seen = new Set(); turnView = null; readSaved = 0;
+  try{$('message').value=localStorage.getItem('aigent.draft.'+session.id)||'';localStorage.setItem('aigent.selectedSession',session.id);}catch{}
   if (window.innerWidth<=700) document.body.classList.remove('sidebar-collapsed');
   $('events').replaceChildren(); $('empty').hidden = true; setText('session-title', session.title); setText('read-saved', '0 символов');
   let cursor = 0;
@@ -100,6 +336,7 @@ async function selectSession(session) {
   source.onerror = () => { /* EventSource reconnects using Last-Event-ID. */ };
   await refresh(); await Promise.all([loadFiles(), loadUsage()]);
   if(current.status==='idle')finishTurn();
+  if(['running','approval'].includes(current.status))startActivity('Агент работает','');else stopActivity();
   $('chat-panel').scrollTop = $('chat-panel').scrollHeight;
 }
 function ensureTurn() {
@@ -142,8 +379,11 @@ function renderTool(t,p,isResult) {
   let item=id?t.tools.find(x=>x.id===id):null;
   if(!item&&isResult&&!id)item=t.tools.find(x=>!x.done&&x.name===p.name);
   if(!item){const row=el('details',undefined,'turn-tool'),label=el('summary'),body=el('div');row.append(label,body);t.actions.append(row);item={id,name:p.name,row,label,body,done:false};t.tools.push(item);}
-  if(!isResult){item.args=p.arguments||{};item.body.append(el('pre',JSON.stringify(item.args,null,2)));}
-  else {item.done=true;item.failed=!!(p.result?.error||p.result?.is_error||p.result?.status==='failed'||(p.result?.exit_code!=null&&p.result.exit_code!==0));item.body.append(el('pre',typeof p.result==='string'?p.result:JSON.stringify(p.result,null,2)));}
+  if(!isResult){item.args=p.arguments||{};structured(item.body,item.args);}
+  else {item.done=true;item.failed=!!(p.result?.error||p.result?.is_error||p.result?.status==='failed'||(p.result?.exit_code!=null&&p.result.exit_code!==0));
+        const output=p.result&&typeof p.result==='object'&&typeof p.result.output==='string'?p.result.output:null;
+        structured(item.body,p.result);
+        if(output)item.body.append(el('pre',output.slice(0,8000),'code-block'));}
   const a=item.args||{},target=a.path||a.pattern||a.query||a.command||a.cmd||'';
   item.label.textContent=(item.done?(item.failed?'! ':'✓ '):'◌ ')+(toolNames[item.name]||item.name)+(target?' · '+String(target).slice(0,150):'');
   item.label.classList.toggle('has-errors',!!item.failed);t.work.hidden=false;updateWork(t);
@@ -152,6 +392,28 @@ function renderEvent(event) {
   if (seen.has(event.id)) return; seen.add(event.id);
   const p = event.payload, kind = event.kind;
   if (kind === 'read_cache') {readSaved += p.avoided_chars; setText('read-saved', fmt(readSaved) + ' символов');}
+  const TOOL_ICONS={read_file:'📖',list_files:'📂',search_files:'🔎',write_file:'✏️',apply_patch:'✏️',
+    exec_command:'⌨️',run_command:'⌨️',shared_image:'🎨',shared_video:'🎞️',shared_skill:'📎',view_image:'🖼️',
+    set_goal:'🎯',ask_user_async:'❓',update_plan:'🗒️'};
+  if (kind === 'user') startActivity('Обдумывает задачу','','🧠');
+  if (kind === 'tool') startActivity(toolNames[p.name]||p.name||'Инструмент',
+      String(p.arguments?.path||p.arguments?.cmd||p.arguments?.query||p.arguments?.prompt||''), TOOL_ICONS[p.name]||'⚙️');
+  if (kind === 'tool_result') startActivity('Работает','','⚙️');
+  if (kind === 'stream') startActivity(activity.label||'Пишет ответ','','✍️');
+  if (kind === 'approval') startActivity('Ждёт подтверждения',String(p.name||''),'⏸️');
+  if (kind === 'turn_completed') stopActivity();
+  if (kind === 'notice' && /Ферма · (видео|изображение) · задача ([\w-]+)/.test(p.text||'')) {
+    const found=(p.text||'').match(/задача ([\w-]+)/);
+    if(found)trackTask(found[1],'Ферма · '+((p.text||'').includes('видео')?'видео':'изображение'),'отправлено',false);
+  }
+  if (kind === 'notice' && /Ферма · (video|image) · (\w+)/.test(p.text||'')) {
+    const stage=(p.text||'').match(/Ферма · \w+ · (\w+)/);
+    for(const [id,task] of activity.tasks){task.detail=stage?stage[1]:task.detail;if(stage&&['done','error'].includes(stage[1]))activity.tasks.delete(id);}
+    renderActivity();
+  }
+  if (kind === 'media' && (p.direction==='generated')) {activity.tasks.clear();renderActivity();}
+  if (kind === 'goal') {renderGoal(p); if(p.status==='done')setTimeout(()=>{if($('goal-banner').classList.contains('status-done'))$('goal-banner').hidden=true;},15000);}
+  if (kind === 'background_question') {showBackgroundQuestion(p);}
   if (['approval', 'approval_closed', 'decision', 'read_cache'].includes(kind)) return;
   const nearBottom = $('chat-panel').scrollHeight - $('chat-panel').scrollTop - $('chat-panel').clientHeight < 160;
   if(kind==='user'){finishTurn();turnView=null;const node=el('article',undefined,'event user');node.append(el('pre',p.text||''));$('events').append(node);}
@@ -168,19 +430,214 @@ function renderEvent(event) {
   } else if(kind==='usage')renderTurnUsage(t,p);
   else if(kind==='tool'||kind==='tool_result')renderTool(t,p,kind==='tool_result');
   else if(['context','provider_session','telegram_payload'].includes(kind)){
-    const detail=el('details',undefined,'turn-detail');detail.append(el('summary',p.text||'Данные подключения'),el('pre',JSON.stringify(p,null,2)));t.actions.append(detail);t.work.hidden=false;
+    const detail=el('details',undefined,'turn-detail');const summary=el('summary',p.text||'Данные подключения');detail.append(summary);structured(detail,p);t.actions.append(detail);t.work.hidden=false;
   } else {
     node = el('article', undefined, 'event ' + kind);
     const names = {user:'ВЫ', assistant:(p.provider||current?.provider||'deepseek').toUpperCase(), tool:'ДЕЙСТВИЕ', tool_result:'РЕЗУЛЬТАТ', media:'ВЛОЖЕНИЕ', error:'ОШИБКА', context:'КОНТЕКСТ', notice:'СОБЫТИЕ', usage:'USAGE'};
     const label = el('div', names[kind] || kind.toUpperCase(), 'event-label'); label.append(el('time', new Date(event.created * 1000).toLocaleTimeString())); node.append(label);
     if (kind === 'media' && p.path) {
-      const a = el('a', p.path); a.href = `/api/sessions/${current.id}/file?path=${encodeURIComponent(p.path)}`; node.append(a, el('small', ' · ' + p.direction));
+      node.append(mediaCard(p, current.id));
     } else if (kind === 'assistant') {const body=el('div',undefined,'rich-message');richText(body,p.text||'');node.append(body);}
-    else node.append(el('pre', p.text || JSON.stringify(p, null, 2)));
+    else if(p.text!==undefined)node.append(el('pre',p.text));
+    else structured(node,p);
     t.answer.append(node);
   }
   }
   if (nearBottom) $('chat-panel').scrollTop = $('chat-panel').scrollHeight;
+}
+const mediaUrl=(sid,path)=>`/api/sessions/${sid}/media?path=${encodeURIComponent(path)}`;
+const isImagePath=(path)=>/\.(png|jpe?g|webp|gif)$/i.test(path);
+const isVideoPath=(path)=>/\.(mp4|webm)$/i.test(path);
+async function pngBlob(sid,path){
+  const response=await fetch(mediaUrl(sid,path));
+  if(!response.ok)throw new Error('Файл недоступен для копирования');
+  const blob=await response.blob();
+  if(blob.type==='image/png')return blob;
+  const bitmap=await createImageBitmap(blob);
+  const canvas=document.createElement('canvas');canvas.width=bitmap.width;canvas.height=bitmap.height;
+  canvas.getContext('2d').drawImage(bitmap,0,0);
+  return new Promise(resolve=>canvas.toBlob(resolve,'image/png'));
+}
+async function copyMedia(sid,path){
+  // The desktop shell copies through the OS clipboard; the browser path needs a granted permission.
+  const blob=await pngBlob(sid,path);
+  if(window.aigentDesktop?.copyImage){
+    const reader=new FileReader();
+    const dataUrl=await new Promise((resolve,reject)=>{reader.onload=()=>resolve(reader.result);reader.onerror=()=>reject(new Error('Не удалось прочитать изображение'));reader.readAsDataURL(blob);});
+    await window.aigentDesktop.copyImage(dataUrl);
+    return 'image';
+  }
+  if(!navigator.clipboard?.write)throw new Error('Браузер не разрешает запись в буфер обмена');
+  try{await navigator.clipboard.write([new ClipboardItem({'image/png':blob})]);return 'image';}
+  catch(error){
+    if(/focus/i.test(error.message))throw new Error('Кликните в окно приложения и повторите копирование');
+    throw new Error('Копирование не разрешено: '+error.message);
+  }
+}
+async function copyFileToClipboard(sid,path){
+  // Not an image: put the real file on the clipboard when the desktop shell is available.
+  if(window.aigentDesktop?.copyFile){
+    const info=await api(`/api/sessions/${sid}/file-path`,{method:'POST',body:{path}});
+    await window.aigentDesktop.copyFile(info.absolute,info.name);
+    return 'file';
+  }
+  const url=new URL(`/api/sessions/${sid}/file?path=${encodeURIComponent(path)}`,location.origin).href;
+  if(!navigator.clipboard?.writeText)throw new Error('Буфер обмена недоступен');
+  await navigator.clipboard.writeText(url);
+  return 'link';
+}
+function openViewer(sid,path){
+  const viewer=$('media-viewer');
+  const stage=$('media-stage');
+  stage.replaceChildren();
+  if(isVideoPath(path)){
+    const video=el('video');video.src=mediaUrl(sid,path);video.controls=true;video.autoplay=true;video.loop=true;stage.append(video);
+  }else{
+    const image=el('img');image.src=mediaUrl(sid,path);image.alt=path;stage.append(image);
+  }
+  setText('media-name',path);
+  setText('media-copy',isVideoPath(path)?'Копировать файл':'Копировать');
+  $('media-copy').onclick=handle(async()=>{
+    if(isVideoPath(path)){const kind=await copyFileToClipboard(sid,path);toast(kind==='file'?'Файл скопирован':'Ссылка скопирована');return;}
+    await copyMedia(sid,path);toast('Изображение скопировано в буфер обмена');});
+  $('media-download').href=`/api/sessions/${sid}/file?path=${encodeURIComponent(path)}`;
+  $('media-download').download=path.split('/').pop();
+  if(viewer.showModal)viewer.showModal();else viewer.open=true;
+}
+function mediaCard(p,sid){
+  const card=el('figure',undefined,'media-card');
+  const path=p.path;
+  if(isImagePath(path)||isVideoPath(path)){
+    const frame=el('button',undefined,'media-frame');frame.type='button';
+    frame.title='Открыть в просмотрщике';
+    if(isVideoPath(path)){
+      const video=el('video');video.src=mediaUrl(sid,path);video.controls=true;video.preload='metadata';
+      frame.onclick=(event)=>{if(event.target!==video)openViewer(sid,path);};
+      frame.append(video);
+    }else{
+      const image=el('img');image.alt=path;image.decoding='async';image.src=mediaUrl(sid,path);
+      image.onerror=()=>{frame.replaceChildren(el('span','Предпросмотр недоступен: файл повреждён или не изображение','media-broken'));};
+      frame.onclick=()=>openViewer(sid,path);
+      frame.append(image);
+    }
+    card.append(frame);
+  }
+  const caption=el('figcaption');
+  caption.append(el('span',path.split('/').pop()),el('small',' · '+(p.direction||'')+(p.billing==='free-farm'?' · ферма':'')));
+  card.append(caption);
+  const actions=el('div',undefined,'media-actions');
+  if(isImagePath(path)||isVideoPath(path)){
+    const open=el('button','Открыть');open.type='button';open.onclick=()=>openViewer(sid,path);
+    actions.append(open);
+  }
+  if(isImagePath(path)){
+    const copy=el('button','Копировать');copy.type='button';
+    copy.onclick=handle(async()=>{await copyMedia(sid,path);toast('Изображение скопировано в буфер обмена');});
+    const reuse=el('button','В сообщение');reuse.type='button';reuse.title='Прикрепить это изображение к следующему сообщению';
+    reuse.onclick=handle(async()=>{
+      const response=await fetch(mediaUrl(sid,path));
+      if(!response.ok)throw new Error('Файл недоступен');
+      const blob=await response.blob();
+      await acceptFiles([new File([blob],path.split('/').pop(),{type:blob.type||'image/png'})]);
+    });
+    actions.append(copy,reuse);
+  }
+  if(!isImagePath(path)){
+    const copyFile=el('button','Копировать файл');copyFile.type='button';
+    copyFile.onclick=handle(async()=>{
+      const kind=await copyFileToClipboard(sid,path);
+      toast(kind==='file'?'Файл скопирован в буфер обмена':'Ссылка на файл скопирована');
+    });
+    actions.append(copyFile);
+  }
+  const download=el('a','Скачать');download.href=`/api/sessions/${sid}/file?path=${encodeURIComponent(path)}`;
+  download.download=path.split('/').pop();actions.append(download);
+  card.append(actions);
+  return card;
+}
+const GOAL_ICONS={analyze:'🔍',code:'💻',fix:'🛠️',generate:'🎨',verify:'✅',deploy:'🚀',wait:'⏳'};
+const STATUS_ICONS={active:'',done:'✔',blocked:'⛔'};
+const shorten=(text,limit)=>{text=String(text||'').replace(/\s+/g,' ').trim();return text.length>limit?text.slice(0,limit-1)+'…':text;};
+function renderGoal(goal){
+  const banner=$('goal-banner');
+  if(!goal||!goal.goal){banner.hidden=true;return;}
+  banner.hidden=false;
+  banner.className='goal-banner kind-'+(goal.kind||'analyze')+' status-'+(goal.status||'active');
+  banner.replaceChildren(el('span',GOAL_ICONS[goal.kind]||'🎯','goal-mark'),
+                         el('span',shorten(goal.goal,46),'goal-text'));
+  if(STATUS_ICONS[goal.status])banner.append(el('span',STATUS_ICONS[goal.status],'goal-status'));
+  banner.title=`Цель (${goal.kind||'—'}, ${goal.status||'active'}): ${goal.goal}`
+    +'\nПока цель активна, ход продолжается автоматически.';
+}
+// A background question is asked once and answered once. The event log replays on every session
+// switch, so a stored answer must win over a reopened card.
+const ANSWERED_QUESTIONS='aigent.answered-questions';
+function answeredQuestionIds(){try{return new Set(JSON.parse(localStorage.getItem(ANSWERED_QUESTIONS)||'[]'));}catch{return new Set();}}
+function answeredQuestionText(id){try{return localStorage.getItem('aigent.answer.'+(id||''))||'';}catch{return '';}}
+function rememberAnswer(id,text){if(!id)return;try{const ids=[...answeredQuestionIds(),id].slice(-300);localStorage.setItem(ANSWERED_QUESTIONS,JSON.stringify(ids));localStorage.setItem('aigent.answer.'+id,String(text||'').slice(0,300));}catch{}}
+function showBackgroundQuestion(p){
+  // Replayed events and repeated polls must not stack copies of one question.
+  const strip=$('background-questions'), id=p.id||'';
+  if(id&&strip.querySelector('[data-question-id="'+id+'"]'))return;
+  strip.append(renderBackgroundQuestion(p));strip.hidden=false;
+}
+function renderBackgroundQuestion(p){
+  const card=el('form',undefined,'background-question');
+  card.dataset.questionId=p.id||'';
+  card.append(el('strong',p.question||'Вопрос агента'));
+  if(p.assumption)card.append(el('small','Работает по допущению: '+p.assumption));
+  if(p.id&&answeredQuestionIds().has(p.id)){
+    card.classList.add('answered');
+    const answer=answeredQuestionText(p.id);
+    card.append(el('small','Вопрос закрыт'+(answer?': '+answer:' — ответ отправлен раньше.')));
+    return card;
+  }
+  const input=el('input');input.placeholder='Ответ — уйдёт агенту сообщением';input.required=true;
+  const send=el('button','Ответить','primary');
+  card.append(input,send);
+  card.onsubmit=handle(async(event)=>{
+    event.preventDefault();
+    const text='Ответ на вопрос агента: '+input.value;
+    await api(`/api/sessions/${current.id}/messages`,{method:'POST',body:{text}});
+    rememberAnswer(p.id,input.value);
+    card.classList.add('answered');
+    card.replaceChildren(el('strong',p.question||'Вопрос агента'),el('small','Вопрос закрыт: '+input.value));
+    await refresh();
+  });
+  return card;
+}
+function renderJson(target,value,depth=0){
+  // Model output is rendered as DOM nodes, never as markup: structure is visible, nothing is executed.
+  const type=value===null?'null':Array.isArray(value)?'array':typeof value;
+  if(type==='array'||type==='object'){
+    const entries=type==='array'?value.map((v,i)=>[i,v]):Object.entries(value);
+    if(!entries.length){target.append(el('span',type==='array'?'[]':'{}','json-punct'));return;}
+    target.append(el('span',type==='array'?'[':'{','json-punct'));
+    const body=el('div',undefined,'json-body');
+    for(const [key,item] of entries){
+      const line=el('div',undefined,'json-line');
+      if(type!=='array')line.append(el('span','"'+key+'"','json-key'),el('span',': ','json-punct'));
+      renderJson(line,item,depth+1);
+      body.append(line);
+    }
+    target.append(body,el('span',type==='array'?']':'}','json-punct'));
+    return;
+  }
+  const text=type==='string'?'"'+value+'"':String(value);
+  target.append(el('span',text,'json-'+type));
+}
+function structured(target,value){
+  let data=value;
+  if(typeof value==='string'){
+    const trimmed=value.trim();
+    if(!(trimmed.startsWith('{')||trimmed.startsWith('['))){target.append(el('pre',value));return false;}
+    try{data=JSON.parse(trimmed);}catch{target.append(el('pre',value));return false;}
+  }
+  if(data===null||typeof data!=='object'){target.append(el('pre',String(data)));return false;}
+  const box=el('div',undefined,'json-view');
+  renderJson(box,data);
+  target.append(box);
+  return true;
 }
 function renderApprovals(items) {
   $('pending-actions').hidden=!items.length;
@@ -215,7 +672,7 @@ async function loadUsage() {
 }
 async function refreshBalance() {setText('balance','…');try {const data = await api('/api/balance'); setText('balance',data.balance_infos.map(b => `${b.currency === 'USD' ? '$' : b.currency + ' '}${b.total_balance}`).join(' / ') || '—');} catch(e) {setText('balance','Недоступен'); throw e;}}
 async function showSettings() {const data=await api('/api/settings'); const f=$('settings-form'); for(const [k,v] of Object.entries(data)) {const field=f.elements.namedItem(k);if(field){if(field.type==='checkbox')field.checked=!!v;else field.value=v;}} f.elements.deepseek_key.placeholder=data.deepseek_configured?'Ключ сохранён · пусто = сохранить':'sk-…';f.elements.telegram_token.placeholder=data.telegram_configured?'Токен сохранён · пусто = сохранить':'123456:…';$('settings-dialog').showModal();}
-async function enter() {$('login').hidden=true;$('workspace').hidden=false;await refresh();if(allSessions.length&&!current) await selectSession(allSessions[0]);clearInterval(refreshTimer);refreshTimer=setInterval(()=>{refresh().catch(()=>{});if(current&&!$('usage-panel').hidden)loadUsage().catch(()=>{});},4000);refreshBalance().catch(()=>{});const settings=await api('/api/settings');setText('thinking-label',settings.thinking?'Thinking включён':'Thinking выключен');}
+async function enter() {$('login').hidden=true;$('workspace').hidden=false;await loadProjects();await refresh();if(allSessions.length&&!current){let saved;try{saved=localStorage.getItem('aigent.selectedSession');}catch{}await selectSession(allSessions.find(s=>s.id===saved)||allSessions[0]);}clearInterval(refreshTimer);refreshTimer=setInterval(()=>{refresh().catch(()=>{});if(current&&!$('usage-panel').hidden)loadUsage().catch(()=>{});},4000);refreshBalance().catch(()=>{});const settings=await api('/api/settings');setText('thinking-label',settings.thinking?'Thinking включён':'Thinking выключен');}
 async function createSession() {const s=await api(current?.chat_id ? '/api/sessions/'+current.id+'/topics' : '/api/sessions',{method:'POST',body:{title:'Сессия '+new Date().toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'})}});await selectSession(s);return s;}
 $('login-form').onsubmit=handle(async()=>{await api('/api/login',{method:'POST',body:{password:$('login-password').value}});$('login-password').value='';await enter();});
 $('new-session').onclick=handle(createSession);
@@ -223,15 +680,22 @@ $('settings-button').onclick=handle(showSettings);
 $('header-settings').onclick=handle(showSettings);
 $('composer-model').onclick=handle(showSettings);
 $('toggle-sidebar').onclick=()=>document.body.classList.toggle('sidebar-collapsed');
-$('attach-button').onclick=()=>document.querySelector('[data-tab="files"]').click();
+$('attach-button').onclick=()=>$('composer-file-picker').click();
 $('close-settings').onclick=()=>{if(!setupToken)$('settings-dialog').close();};
 $('settings-dialog').addEventListener('cancel',e=>{if(setupToken)e.preventDefault();});
 $('settings-form').onsubmit=handle(async()=>{const f=$('settings-form'),body={};for(const field of f.elements){if(!field.name)continue;body[field.name]=field.type==='checkbox'?field.checked:field.type==='number'?Number(field.value):field.value;}const adminPassword=body.admin_password;
   await api(setupToken?'/api/setup':'/api/settings',{method:'POST',body,headers:setupToken?{Authorization:'Bearer '+setupToken}:{}});
   if(setupToken||adminPassword)await api('/api/login',{method:'POST',body:{password:adminPassword}});
   setupToken='';history.replaceState(null,'',location.pathname);$('settings-dialog').close();for(const field of f.elements)if(field.type==='password')field.value='';await enter();toast('Настройки сохранены');});
-$('composer').onsubmit=handle(async()=>{const text=$('message').value.trim();if(!text)return;if(!current)await createSession();await api(`/api/sessions/${current.id}/messages`,{method:'POST',body:{text}});$('message').value='';await refresh();});
+$('composer').onsubmit=handle(async()=>{if(!current)await createSession();await submitMessage();});
 $('message').onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();$('composer').requestSubmit();}};
+$('auto-approve').onchange=handle(async()=>{
+  if(!current){$('auto-approve').checked=false;throw new Error('Сначала выберите или создайте чат');}
+  current=await api('/api/sessions/'+current.id,{method:'PATCH',body:{auto_approve:$('auto-approve').checked}});
+  toast(current.auto_approve?'Автоприменение включено: команды и правки выполняются без подтверждения':'Подтверждения снова обязательны');
+  await refresh();
+});
+$('session-project')?.addEventListener('click',()=>{if(typeof window.showSessionMenu==='function')window.showSessionMenu().catch(error=>toast(error.message));});
 $('stop-button').onclick=handle(async()=>{if(current){await api(`/api/sessions/${current.id}/stop`,{method:'POST'});toast('Запрошена остановка');}});
 $('refresh-balance').onclick=handle(refreshBalance);$('refresh-files').onclick=handle(loadFiles);
 $('upload-form').onsubmit=handle(async()=>{if(!current)await createSession();const file=$('upload-file').files[0];if(!file)throw new Error('Выберите файл');const body=new FormData();body.set('file',file);body.set('kind',$('media-kind').value);body.set('caption',$('media-caption').value);body.set('send_telegram',$('send-telegram').checked);body.set('ask_agent',$('ask-agent').checked);const result=await api(`/api/sessions/${current.id}/files`,{method:'POST',body});toast(result.telegram_delivered?'Файл доставлен в Telegram':'Файл сохранён');$('upload-file').value='';await loadFiles();});

@@ -1,6 +1,7 @@
 """Start one web server + one Telegram long poller. All state stays in this project."""
 import argparse
 import os
+import sys
 import threading
 import webbrowser
 from pathlib import Path
@@ -18,6 +19,8 @@ def main():
     parser.add_argument("--data-dir", type=Path)
     parser.add_argument("--no-telegram", action="store_true")
     parser.add_argument("--helper", choices=["claude-history"])
+    parser.add_argument("--supervise", action="store_true",
+                        help="Run under a supervisor that restarts the server and rolls back a broken self-edit")
     parser.add_argument("--external-id")
     args = parser.parse_args()
     if args.helper == "claude-history":
@@ -32,7 +35,13 @@ def main():
             result = [dataclasses.asdict(s) for s in list_sessions(limit=50)]
         print(json.dumps(result, ensure_ascii=True))
         return
-    root = args.data_dir.resolve() if args.data_dir else Path(__file__).resolve().parent / ".local"
+    project = Path(__file__).resolve().parent
+    root = args.data_dir.resolve() if args.data_dir else project / ".local"
+    if args.supervise and not os.environ.get("AIGENT_SUPERVISED"):
+        from connector.supervisor import supervise
+        root.mkdir(parents=True, exist_ok=True)
+        passthrough = [a for a in sys.argv[1:] if a != "--supervise"]
+        raise SystemExit(supervise(project, root, passthrough))
     temp = root / "tmp"
     temp.mkdir(parents=True, exist_ok=True)
     os.environ.update(TEMP=str(temp), TMP=str(temp), TMPDIR=str(temp))

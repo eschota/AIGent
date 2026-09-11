@@ -11,7 +11,8 @@ New-Item -ItemType Directory -Force $env:TEMP | Out-Null
 & .\desktop\node_modules\.bin\esbuild.cmd .\desktop\ui-entry.js --bundle --minify --format=iife --outfile=connector/static/widgets.js --legal-comments=linked
 if ($LASTEXITCODE) { throw 'UI bundle failed' }
 $staticData = (Join-Path $project 'connector\static') + ';connector/static'
-& .\.venv\Scripts\python.exe -m PyInstaller --noconfirm --name AIGentServer --onedir --distpath .local/build/backend --workpath .local/build/pyinstaller --specpath .local/build --add-data $staticData --collect-submodules claude_agent_sdk --collect-submodules uvicorn --collect-submodules connector run.py
+$resourceData = (Join-Path $project 'connector\resources') + ';connector/resources'
+& .\.venv\Scripts\python.exe -m PyInstaller --noconfirm --name AIGentServer --onedir --distpath .local/build/backend --workpath .local/build/pyinstaller --specpath .local/build --add-data $staticData --add-data $resourceData --collect-submodules claude_agent_sdk --collect-submodules uvicorn --collect-submodules connector --collect-submodules trimesh run.py
 if ($LASTEXITCODE) { throw 'Backend packaging failed' }
 Set-Location -LiteralPath (Join-Path $project 'desktop')
 & npm.cmd run pack

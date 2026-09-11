@@ -154,6 +154,9 @@ class Agent:
         A message sent mid-turn never interrupts the agent and never cancels pending output.
         """
         sid = session["id"]
+        # A message from the owner supersedes questions the agent left open: they stop hanging.
+        for qid in self.store.close_questions(sid):
+            self.store.event(sid, "background_answered", {"id": qid, "reason": "superseded"})
         if not self.busy(sid):
             self.start(session, content)
             return {"accepted": True, "queued": False, "position": 0}
@@ -633,8 +636,9 @@ class Agent:
                                                           if goal["status"] == "active" else "")}
         if name == "ask_user_async":
             qid = secrets.token_hex(6)
-            self.store.event(sid, "background_question", {"id": qid, "question": str(args["question"])[:600],
-                                                          "assumption": str(args["assumption"])[:600]})
+            question, assumption = str(args["question"])[:600], str(args["assumption"])[:600]
+            self.store.ask_async(sid, qid, question, assumption)
+            self.store.event(sid, "background_question", {"id": qid, "question": question, "assumption": assumption})
             try:
                 await self.telegram.text(session, "❓ " + str(args["question"])[:900] +
                                          "\nПока работаю по допущению: " + str(args["assumption"])[:400])

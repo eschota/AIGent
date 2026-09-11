@@ -304,6 +304,7 @@ async function refresh() {
   autoToggle.classList.toggle('on',!!selected?.auto_approve);
   await loadQueue();
   await loadContext();
+  await loadQuestions();
   renderApprovals(approvals.filter(a => a.sid === current?.id));
 }
 function updateSessionStats(u) {
@@ -322,6 +323,7 @@ async function selectSession(session) {
   for(const item of attachments)if(item.preview&&URL.revokeObjectURL)URL.revokeObjectURL(item.preview);
   attachments=[];renderAttachments();
   renderGoal(null);$('background-questions').replaceChildren();$('background-questions').hidden=true;
+  loadQuestions().catch(()=>{});
   if (source) source.close(); current = session; seen = new Set(); turnView = null; readSaved = 0;
   try{$('message').value=localStorage.getItem('aigent.draft.'+session.id)||'';localStorage.setItem('aigent.selectedSession',session.id);}catch{}
   if (window.innerWidth<=700) document.body.classList.remove('sidebar-collapsed');
@@ -389,6 +391,49 @@ function renderTool(t,p,isResult) {
   item.label.textContent=(item.done?(item.failed?'! ':'✓ '):'◌ ')+(toolNames[item.name]||item.name)+(target?' · '+String(target).slice(0,150):'');
   item.label.classList.toggle('has-errors',!!item.failed);t.work.hidden=false;updateWork(t);
 }
+const FARM_STAGES={pending:['⏳','в очереди'],rendering:['🎬','рендер'],done:['✅','готово'],
+  ready:['✅','готово'],error:['⛔','ошибка'],failed:['⛔','ошибка'],discarded:['⛔','отменено']};
+function farmNotice(text,payload){
+  // "Ферма · видео · задача <id> · кадр <path>" and "Ферма · video · rendering" become one chip.
+  if(!/Ферма/.test(text||''))return null;
+  const id=payload.task_id||(text.match(/задача ([\w-]+)/)||[])[1];
+  if(!id)return null;
+  const stage=(text.match(/·\s*(pending|rendering|done|ready|error|failed|discarded)\s*$/i)||[])[1];
+  const frame=(text.match(/кадр (\S+)/)||[])[1];
+  const kind=/видео|video/.test(text)?'video':'image';
+  return {id,stage:stage?stage.toLowerCase():'',frame,kind};
+}
+function renderFarmChip(turn,info){
+  let chip=turn.farm?.get(info.id);
+  if(!chip){
+    const row=el('div',undefined,'farm-chip');
+    const thumb=el('span',undefined,'farm-thumb');
+    const icon=el('span',info.kind==='video'?'🎞️':'🎨','farm-icon');
+    const stage=el('span','⏳ в очереди','farm-stage');
+    const time=el('span','','farm-time');
+    row.append(thumb,icon,stage,time);
+    row.title='Задача фермы '+info.id;
+    turn.actions.append(row);turn.work.hidden=false;
+    chip={row,thumb,icon,stage,time,since:Date.now()};
+    (turn.farm=turn.farm||new Map()).set(info.id,chip);
+    chip.timer=setInterval(()=>{chip.time.textContent=elapsed(chip.since);},1000);
+    chip.time.textContent=elapsed(chip.since);
+  }
+  if(info.frame&&!chip.thumb.firstChild&&current){
+    const image=el('img');image.alt='';image.src=mediaUrl(current.id,info.frame);
+    image.onerror=()=>image.remove();
+    chip.thumb.append(image);
+  }
+  if(info.stage){
+    const [mark,label]=FARM_STAGES[info.stage]||['•',info.stage];
+    chip.stage.textContent=mark+' '+label;
+    chip.row.classList.toggle('active',['pending','rendering'].includes(info.stage));
+    if(['done','ready','error','failed','discarded'].includes(info.stage)){
+      clearInterval(chip.timer);chip.row.classList.add('finished');
+    }
+  }
+  return chip;
+}
 function renderEvent(event) {
   if (seen.has(event.id)) return; seen.add(event.id);
   const p = event.payload, kind = event.kind;
@@ -414,13 +459,19 @@ function renderEvent(event) {
   }
   if (kind === 'media' && (p.direction==='generated')) {activity.tasks.clear();renderActivity();}
   if (kind === 'goal') {renderGoal(p); if(p.status==='done')setTimeout(()=>{if($('goal-banner').classList.contains('status-done'))$('goal-banner').hidden=true;},15000);}
-  if (kind === 'background_question') {showBackgroundQuestion(p);}
+  // Ask the server which questions are still open: a replayed event must not reopen a closed one.
+  if (kind === 'background_question') loadQuestions();
+  if (kind === 'background_answered') closeBackgroundQuestion(p.id);
   if (['approval', 'approval_closed', 'decision', 'read_cache'].includes(kind)) return;
   const nearBottom = $('chat-panel').scrollHeight - $('chat-panel').scrollTop - $('chat-panel').clientHeight < 160;
   if(kind==='user'){finishTurn();turnView=null;const node=el('article',undefined,'event user');node.append(el('pre',p.text||''));$('events').append(node);}
   else if(kind==='turn_completed')finishTurn();
   else {
   const t=ensureTurn();let node;
+  if(kind==='notice'){
+    const info=farmNotice(p.text,p);
+    if(info){renderFarmChip(t,info);if(nearBottom)$('chat-panel').scrollTop=$('chat-panel').scrollHeight;return;}
+  }
   if (kind === 'stream') {
     let stream=t.streams.get(p.id);
     if(!stream){stream={reasoning:'',preview:el('pre','', 'live-answer')};t.streams.set(p.id,stream);t.answer.append(stream.preview);}
@@ -435,7 +486,7 @@ function renderEvent(event) {
     const body=el('div');detail.append(body);lazyStructured(detail,body,p);t.actions.append(detail);t.work.hidden=false;
   } else {
     node = el('article', undefined, 'event ' + kind);
-    const names = {user:'ВЫ', assistant:(p.provider||current?.provider||'deepseek').toUpperCase(), tool:'ДЕЙСТВИЕ', tool_result:'РЕЗУЛЬТАТ', media:'ВЛОЖЕНИЕ', error:'ОШИБКА', context:'КОНТЕКСТ', notice:'СОБЫТИЕ', usage:'USAGE'};
+    const names = {user:'ВЫ', assistant:(p.provider||current?.provider||'deepseek').toUpperCase(), tool:'ДЕЙСТВИЕ', tool_result:'РЕЗУЛЬТАТ', media:'🖼 ВЛОЖЕНИЕ', error:'⛔ ОШИБКА', context:'📋 КОНТЕКСТ', notice:'•', usage:'USAGE'};
     const label = el('div', names[kind] || kind.toUpperCase(), 'event-label'); label.append(el('time', new Date(event.created * 1000).toLocaleTimeString())); node.append(label);
     if (kind === 'media' && p.path) {
       node.append(mediaCard(p, current.id));
@@ -571,42 +622,51 @@ function renderGoal(goal){
   banner.title=`Цель (${goal.kind||'—'}, ${goal.status||'active'}): ${goal.goal}`
     +'\nПока цель активна, ход продолжается автоматически.';
 }
-// A background question is asked once and answered once. The event log replays on every session
-// switch, so a stored answer must win over a reopened card.
-const ANSWERED_QUESTIONS='aigent.answered-questions';
-function answeredQuestionIds(){try{return new Set(JSON.parse(localStorage.getItem(ANSWERED_QUESTIONS)||'[]'));}catch{return new Set();}}
-function answeredQuestionText(id){try{return localStorage.getItem('aigent.answer.'+(id||''))||'';}catch{return '';}}
-function rememberAnswer(id,text){if(!id)return;try{const ids=[...answeredQuestionIds(),id].slice(-300);localStorage.setItem(ANSWERED_QUESTIONS,JSON.stringify(ids));localStorage.setItem('aigent.answer.'+id,String(text||'').slice(0,300));}catch{}}
-function showBackgroundQuestion(p){
-  // Replayed events and repeated polls must not stack copies of one question.
-  const strip=$('background-questions'), id=p.id||'';
-  if(id&&strip.querySelector('[data-question-id="'+id+'"]'))return;
-  strip.append(renderBackgroundQuestion(p));strip.hidden=false;
+// The server owns a background question: it is asked once, retired when it gets stale, and a
+// closed one never comes back — reloading the page cannot resurrect it from the event log.
+async function loadQuestions(){
+  const strip=$('background-questions');
+  if(!current){strip.replaceChildren();strip.hidden=true;return;}
+  let open=[];
+  try{open=await api(`/api/sessions/${current.id}/async-questions`);}catch{return;}
+  const alive=new Set(open.map(item=>String(item.id)));
+  for(const card of [...strip.children])if(!alive.has(card.dataset.questionId))card.remove();
+  for(const item of open)showBackgroundQuestion(item);
+  strip.hidden=!strip.children.length;
 }
-function renderBackgroundQuestion(p){
+function closeBackgroundQuestion(id){
+  const strip=$('background-questions');
+  const card=[...strip.children].find(node=>node.dataset.questionId===String(id||''));
+  if(card)card.remove();
+  strip.hidden=!strip.children.length;
+}
+function showBackgroundQuestion(p){
+  const strip=$('background-questions'), id=String(p.id||'');
+  if(!id||[...strip.children].some(node=>node.dataset.questionId===id))return;
   const card=el('form',undefined,'background-question');
-  card.dataset.questionId=p.id||'';
-  card.append(el('strong',p.question||'Вопрос агента'));
-  if(p.assumption)card.append(el('small','Работает по допущению: '+p.assumption));
-  if(p.id&&answeredQuestionIds().has(p.id)){
-    card.classList.add('answered');
-    const answer=answeredQuestionText(p.id);
-    card.append(el('small','Вопрос закрыт'+(answer?': '+answer:' — ответ отправлен раньше.')));
-    return card;
-  }
-  const input=el('input');input.placeholder='Ответ — уйдёт агенту сообщением';input.required=true;
+  card.dataset.questionId=id;
+  const head=el('div',undefined,'question-head');
+  head.append(el('span','❓','question-icon'),el('strong',shorten(p.question,150)));
+  card.append(head);
+  if(p.assumption)card.append(el('small','▸ допущение: '+shorten(p.assumption,120)));
+  const row=el('div',undefined,'question-row');
+  const input=el('input');input.placeholder='Ответ агенту…';input.required=true;
   const send=el('button','Ответить','primary');
-  card.append(input,send);
+  const close=el('button','Закрыть');close.type='button';close.title='Закрыть вопрос без ответа';
+  close.onclick=handle(async()=>{
+    await api(`/api/sessions/${current.id}/async-questions/${id}`,{method:'POST',body:{answer:''}});
+    closeBackgroundQuestion(id);
+  });
+  row.append(input,send,close);card.append(row);
+  card.title=p.question||'';
   card.onsubmit=handle(async(event)=>{
     event.preventDefault();
-    const text='Ответ на вопрос агента: '+input.value;
-    await api(`/api/sessions/${current.id}/messages`,{method:'POST',body:{text}});
-    rememberAnswer(p.id,input.value);
-    card.classList.add('answered');
-    card.replaceChildren(el('strong',p.question||'Вопрос агента'),el('small','Вопрос закрыт: '+input.value));
+    const result=await api(`/api/sessions/${current.id}/async-questions/${id}`,{method:'POST',body:{answer:input.value}});
+    closeBackgroundQuestion(id);
+    toast(result.queued?'Ответ поставлен в очередь агенту':'Ответ отправлен агенту');
     await refresh();
   });
-  return card;
+  strip.append(card);strip.hidden=false;
 }
 function renderJson(target,value,depth=0){
   // Model output is rendered as DOM nodes, never as markup: structure is visible, nothing is executed.

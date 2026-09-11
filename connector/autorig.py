@@ -29,7 +29,8 @@ image_url instead of prompt runs the gen_animation_by_url workflow and returns a
 Use shared_video(path, prompt, frames, size) for it. Never poll the farm with a shell command:
 a run_command times out long before a render finishes, while shared_video waits inside the tool,
 keeps the chat free and survives a connector restart.
-frames counts at 25 fps and must be 8*k+1 (121 ~ 5 s, 241 ~ 10 s, 297 ~ 12 s, the API cap);
+frames counts at 25 fps and must be 8*k+1 (121 ~ 5 s, 241 ~ 10 s, 297 ~ 12 s, the API
+cap), and an omitted length now defaults to 121 frames, five seconds;
 size is WIDTHxHEIGHT within 64..512 in steps of 32, and an omitted size now defaults to
 512x256 (16:8). Both only take effect when the deployed template carries
 $frames/$width/$height; otherwise the workflow renders its built-in length,

@@ -95,6 +95,10 @@ class FileLocation(BaseModel):
     path: str = Field(min_length=1, max_length=400)
 
 
+class AsyncAnswer(BaseModel):
+    answer: str = Field(default="", max_length=4000)
+
+
 class ToolBody(BaseModel):
     args: dict[str, str | int] = Field(default_factory=dict)
 
@@ -743,6 +747,23 @@ def create_app(root: Path | None = None, polling=True):
     async def context_usage(sid: str):
         require_session(sid)
         return agent.context_size(sid)
+
+    @app.get("/api/sessions/{sid}/async-questions", dependencies=[Depends(require_admin)])
+    async def async_questions(sid: str):
+        require_session(sid)
+        return [{k: row[k] for k in ("id", "question", "assumption", "created")}
+                for row in store.open_questions(sid)]
+
+    @app.post("/api/sessions/{sid}/async-questions/{qid}", dependencies=[Depends(require_admin)])
+    async def answer_async_question(sid: str, qid: str, body: AsyncAnswer):
+        session = require_session(sid)
+        answer = body.answer.strip()
+        if not store.close_question(qid, "answered" if answer else "dismissed", answer or None):
+            return {"closed": False, "note": "Вопрос уже закрыт"}
+        store.event(sid, "background_answered", {"id": qid, "reason": "answered" if answer else "dismissed"})
+        if answer:
+            return agent.submit(session, f"Ответ на вопрос агента: {answer}") | {"closed": True}
+        return {"closed": True, "queued": False}
 
     @app.get("/api/sessions/{sid}/queue", dependencies=[Depends(require_admin)])
     async def queue_list(sid: str):

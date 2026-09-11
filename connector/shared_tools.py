@@ -30,6 +30,7 @@ FPS = 25
 MAX_FRAMES = 300  # RenderPrompt.frame_count is clamped to 300 by the farm API
 VIDEO_SIZE_STEP = 32  # routing.clamp_video_dims: 64..512 in multiples of 32
 DEFAULT_VIDEO_SIZE = "512x256"  # 16:8 — the frame ratio the owner wants for clips
+DEFAULT_VIDEO_FRAMES = 121  # 5 s at FPS — the clip length the owner wants
 POLL_SECONDS = 10
 
 
@@ -53,7 +54,7 @@ class SharedTools:
                             "Рендер может идти 20+ минут: чат остаётся свободным, ожидание переживает перезапуск.",
              "fields": [{"name": "path", "label": "Файл изображения в рабочей папке", "type": "text", "required": True},
                         {"name": "prompt", "label": "Движение камеры и сцены", "type": "text", "required": False},
-                        {"name": "frames", "label": "Кадров при 25 fps: 121 ≈ 5 с, 241 ≈ 10 с, 301 ≈ 12 с", "type": "text", "required": False},
+                        {"name": "frames", "label": "Кадров при 25 fps; по умолчанию 121 ≈ 5 с, максимум 241 ≈ 10 с", "type": "text", "required": False},
                         {"name": "size", "label": "Размер кадра; по умолчанию 512x256 (16:8), 64–512 с шагом 32", "type": "text", "required": False},
                         {"name": "work_flow", "label": "Воркфлоу фермы (пусто = по умолчанию)", "type": "text", "required": False}],
              "billing": "free-farm", "background": True, "providers": "any"},
@@ -169,10 +170,8 @@ class SharedTools:
 
     @staticmethod
     def video_frames(value):
-        """LTXV wants 8*k+1 frames; the farm API clamps frame_count to 300 (12 s at 25 fps)."""
-        count = int(value or 0)
-        if count <= 0:
-            return 0
+        """LTXV wants 8*k+1 frames; the farm API clamps frame_count to 300 (12 s)."""
+        count = int(value or 0) or DEFAULT_VIDEO_FRAMES
         count = max(9, min(MAX_FRAMES, count))
         return max(1, round((count - 1) / 8)) * 8 + 1
 

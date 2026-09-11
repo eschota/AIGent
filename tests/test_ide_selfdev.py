@@ -380,9 +380,11 @@ class FarmClient:
 
     def __init__(self, image, status="done", error=""):
         self.image, self.status, self.error, self.calls = image, status, error, []
+        self.bodies = []
 
     async def request(self, method, url, **kwargs):
         self.calls.append((method, url))
+        self.bodies.append(kwargs.get("json") or {})
         if url.endswith("/dev/api/scratch"):
             return FarmResponse({"url": "https://autorig.online/dev/api/scratch/frame.png"})
         if url.endswith("/renderfin/api-render"):
@@ -472,6 +474,12 @@ async def test_farm_video_renders_from_a_frame_and_survives_a_restart(bundle):
     media = [e for e in store.events(session["id"]) if e["kind"] == "media"][-1]
     assert media["payload"]["kind"] == "video"
     assert any(url.endswith("/dev/api/scratch") for _, url in client.calls), "the frame is published before rendering"
+    # the owner asked for a 16:8 frame, five seconds long, without passing either field
+    rendered = [body for (_, url), body in zip(client.calls, client.bodies)
+                if url.endswith("/renderfin/api-render")]
+    assert rendered[-1]["frame_count"] == 121, "an omitted length is five seconds"
+    assert (rendered[-1]["main_size_width"], rendered[-1]["main_size_height"]) == (512, 256)
+    assert shared.video_size("512x256") == (512, 256)
     assert not shared.pending(), "a finished task is no longer pending"
 
     # A task still rendering when the server stops is picked up again after the restart.
@@ -713,3 +721,52 @@ def test_a_revision_that_serves_becomes_the_rollback_target(tmp_path, monkeypatc
     assert keeper.good == supervisor.revision(root)
     assert (keeper.snapshots / keeper.good).is_dir(), "the working revision is kept for rollback"
     assert keeper.restarts == 1
+
+
+# 24 ---------------------------------------------------------------------------------
+async def test_background_questions_close_and_never_pile_up(bundle):
+    config, store, agent = bundle
+    session = store.resolve(40, 0, 1)
+    sid = session["id"]
+
+    for index in range(5):
+        await agent.execute(session, "ask_user_async",
+                            {"question": f"вопрос {index}?", "assumption": f"допущение {index}"})
+
+    open_now = store.open_questions(sid)
+    assert len(open_now) == store.OPEN_QUESTIONS, "older questions retire instead of accumulating"
+    assert [row["question"] for row in open_now] == ["вопрос 2?", "вопрос 3?", "вопрос 4?"]
+
+    # Answering closes exactly one and it stays closed when the page is reloaded.
+    assert store.close_question(open_now[0]["id"], "answered", "да") == 1
+    assert store.close_question(open_now[0]["id"], "answered", "да") == 0, "closing twice is a no-op"
+    assert [row["id"] for row in store.open_questions(sid)] == [open_now[1]["id"], open_now[2]["id"]]
+
+    # A message from the owner supersedes whatever is still hanging.
+    agent.submit(session, "продолжай, это уже неважно")
+    assert store.open_questions(sid) == []
+    closed = [e["payload"]["id"] for e in store.events(sid) if e["kind"] == "background_answered"]
+    assert set(closed) == {open_now[1]["id"], open_now[2]["id"]}
+    agent.stop(sid)
+
+
+# 25 ---------------------------------------------------------------------------------
+def test_the_api_lists_only_open_questions_and_answers_them_once(web):
+    app, client = web
+    sid = client.post("/api/sessions", json={"title": "questions"}).json()["id"]
+    store = app.state.store
+    store.ask_async(sid, "q1", "16:9 или 1:1?", "делаю 16:9")
+    store.ask_async(sid, "q2", "звук нужен?", "без звука")
+
+    listed = client.get(f"/api/sessions/{sid}/async-questions").json()
+    assert [item["id"] for item in listed] == ["q1", "q2"]
+    assert "status" not in listed[0]
+
+    app.state.agent.submit = lambda session, content, queue=True: {"accepted": True, "queued": True, "position": 1}
+    answered = client.post(f"/api/sessions/{sid}/async-questions/q1", json={"answer": "16:9"}).json()
+    assert answered["closed"] is True and answered["queued"] is True
+    assert client.post(f"/api/sessions/{sid}/async-questions/q1", json={"answer": "16:9"}).json()["closed"] is False
+
+    dismissed = client.post(f"/api/sessions/{sid}/async-questions/q2", json={"answer": ""}).json()
+    assert dismissed == {"closed": True, "queued": False}
+    assert client.get(f"/api/sessions/{sid}/async-questions").json() == []

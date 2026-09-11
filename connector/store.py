@@ -40,6 +40,10 @@ class Store:
           id TEXT PRIMARY KEY, path TEXT UNIQUE, name TEXT, title TEXT, summary TEXT,
           source TEXT, origin TEXT, tags TEXT DEFAULT '[]', digest TEXT, bytes INTEGER,
           modified REAL, indexed REAL, uses INTEGER DEFAULT 0, used_at REAL, analysis TEXT DEFAULT 'local');
+        CREATE TABLE IF NOT EXISTS async_questions (
+          id TEXT PRIMARY KEY, session_id TEXT, question TEXT, assumption TEXT,
+          created REAL, closed REAL, status TEXT DEFAULT 'open', answer TEXT);
+        CREATE INDEX IF NOT EXISTS async_questions_session ON async_questions(session_id, status);
         CREATE INDEX IF NOT EXISTS skills_modified ON skills(modified DESC);
         CREATE INDEX IF NOT EXISTS queue_session ON queued_messages(session_id, id);
         CREATE INDEX IF NOT EXISTS events_session ON events(session_id, id);
@@ -150,6 +154,33 @@ class Store:
         sql = "UPDATE queued_messages SET status='cancelled' WHERE session_id=? AND status='pending'"
         cur = self.execute(sql + (" AND id=?" if qid else ""), (sid, qid) if qid else (sid,))
         return cur.rowcount
+
+    OPEN_QUESTIONS = 3
+
+    def ask_async(self, sid, qid, question, assumption):
+        """Record a non-blocking question and retire the oldest ones so they cannot pile up."""
+        self.execute("INSERT OR REPLACE INTO async_questions(id,session_id,question,assumption,created,status) "
+                     "VALUES (?,?,?,?,?,'open')", (qid, sid, question, assumption, time.time()))
+        # A coarse clock gives identical timestamps, so insertion order decides which ones retire.
+        extra = self.rows("SELECT id FROM async_questions WHERE session_id=? AND status='open' "
+                          "ORDER BY created DESC, rowid DESC LIMIT -1 OFFSET ?", (sid, self.OPEN_QUESTIONS))
+        for row in extra:
+            self.close_question(row["id"], "expired")
+        return qid
+
+    def open_questions(self, sid):
+        return self.rows("SELECT * FROM async_questions WHERE session_id=? AND status='open' ORDER BY created, rowid", (sid,))
+
+    def close_question(self, qid, status="closed", answer=None):
+        cur = self.execute("UPDATE async_questions SET status=?, closed=?, answer=? WHERE id=? AND status='open'",
+                           (status, time.time(), answer, qid))
+        return cur.rowcount
+
+    def close_questions(self, sid, status="superseded"):
+        rows = self.open_questions(sid)
+        for row in rows:
+            self.close_question(row["id"], status)
+        return [row["id"] for row in rows]
 
     def add_usage(self, sid, usage):
         self.execute("INSERT INTO usage(session_id,payload,created) VALUES (?,?,?)",

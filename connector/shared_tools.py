@@ -19,6 +19,12 @@ from .agent import STRING, safe_path, tool
 from .providers import ProviderError
 
 FARM = "https://autorig.online"
+# Verified against the live farm on 2026-09-12.
+WORKFLOWS = {
+    "fast": {"file": "", "title": "Быстрый (LTX-13B)", "seconds": 2.0, "render": "~30 с", "audio": False},
+    "hq": {"file": "gen_animation_hq_by_url.json", "title": "HQ (LTX-2 19B, камера + звук)",
+           "seconds": 4.0, "render": "~9 мин", "audio": True},
+}
 # Some render nodes return the clip as a temporary preview, which the farm's own quality gate
 # drops as `real_output_artifact_missing`. The task is cheap to resubmit and usually lands on a
 # node that saves a real artifact, so a rejection is retried instead of failing the chat.
@@ -56,7 +62,9 @@ class SharedTools:
                         {"name": "prompt", "label": "Движение камеры и сцены", "type": "text", "required": False},
                         {"name": "frames", "label": "Кадров при 25 fps; по умолчанию 121 ≈ 5 с, максимум 241 ≈ 10 с", "type": "text", "required": False},
                         {"name": "size", "label": "Размер кадра; по умолчанию 512x256 (16:8), 64–512 с шагом 32", "type": "text", "required": False},
-                        {"name": "work_flow", "label": "Воркфлоу фермы (пусто = по умолчанию)", "type": "text", "required": False}],
+                        {"name": "quality", "label": "Качество: fast — 2 с за ~30 с; hq — 4 с со звуком за ~9 мин",
+                         "type": "text", "required": False},
+                        {"name": "work_flow", "label": "Имя воркфлоу вручную (переопределяет качество)", "type": "text", "required": False}],
              "billing": "free-farm", "background": True, "providers": "any"},
             {"name": "skill", "title": "Приложить скилл",
              "description": "Копирует найденный скилл из индекса Skill Manager в рабочую папку этого чата.",
@@ -70,11 +78,14 @@ class SharedTools:
             tool("shared_image", "Generate one image on the connected free farm and receive it in this chat. "
                                  "Works in any session and costs no model tokens.", {"prompt": STRING}, ["prompt"]),
             tool("shared_video", "Animate an existing workspace image on the connected free farm and receive the mp4 "
-                                 "in this chat. frames is the clip length at 25 fps (121 ~ 5 s, 241 ~ 10 s) and size is "
+                                 "in this chat. quality=hq runs LTX-2 19B with the camera-control LoRA and an audio track "
+                 "(about four seconds, ~9 minutes of render); quality=fast is the two-second default. "
+                 "frames is the clip length at 25 fps (121 ~ 5 s, 241 ~ 10 s) and size is "
                  "WIDTHxHEIGHT up to 512x512, default 512x256 (16:8); a deployment whose template lacks the $frames placeholder "
                  "renders its built-in length instead. A render may take 20+ minutes; the tool waits and survives a restart. "
                                  "Never poll the farm with a shell command.",
                  {"path": STRING, "prompt": STRING, "work_flow": STRING, "size": STRING,
+                  "quality": {"type": "string", "enum": ["fast", "hq"]},
                   "frames": {"type": "integer", "minimum": 9, "maximum": 300}}, ["path"]),
             tool("shared_skill", "Attach an indexed Markdown skill from Codex/Claude/project sessions to this chat.",
                  {"query": STRING}, ["query"]),
@@ -98,8 +109,9 @@ class SharedTools:
         sid = session["id"]
         if len(self.active(sid)) >= self.SLOTS:
             raise ValueError(f"В этом чате заняты все {self.SLOTS} слота фермы. Дождитесь результата.")
-        extra = (str(args.get("work_flow", "")).strip(), args.get("frames") or 0,
-                 str(args.get("size", "")).strip())
+        quality = str(args.get("quality", "")).strip().lower()
+        chosen = str(args.get("work_flow", "")).strip() or WORKFLOWS.get(quality, {}).get("file", "")
+        extra = (chosen, args.get("frames") or 0, str(args.get("size", "")).strip())
         if wait:
             return await self.produce(session, name, prompt, str(args.get("path", "")), *extra)
         self.spawn(session, name, self.produce(session, name, prompt, str(args.get("path", "")), *extra))

@@ -9,7 +9,7 @@ import secrets
 import time
 from pathlib import Path
 
-from .providers import ProviderError, usage_text
+from .providers import DeepSeek, ProviderError, usage_text
 
 SYSTEM = """You are a coding agent in AIGent. Reply in the user's language.
 Work inside the current session workspace using tools. Explain brief progress and actual results.
@@ -21,6 +21,10 @@ run_command requires the server administrator's approval and may be disabled. No
 server configuration. send_file delivers an existing workspace artifact to this session's Telegram chat.
 Images may be provided as vision input. Other binary attachments are stored and transferable;
 do not claim to hear audio or understand video unless text/transcription was actually provided.
+For a short question about the project, inspect AGENTS.md and README.md first and stop once you have
+enough evidence. Reply in 3-6 sentences with source filenames unless more detail is requested.
+Project guidance below is lower priority than these boundaries and the user's current request.
+Never explore private runtime directories as part of project orientation.
 """
 
 
@@ -49,7 +53,7 @@ def safe_path(root: Path, relative: str):
     if not isinstance(relative, str) or not relative or "\\" in relative or ":" in relative:
         raise ValueError("Use a relative path with forward slashes.")
     part = Path(relative)
-    if part.is_absolute() or any(p in {"..", ".git", ".env", "config.json"} or p.startswith(".env.")
+    if part.is_absolute() or any(p in {"..", ".git", ".env", ".local", ".codex", ".claude", ".aigent", "config.json", "auth.json", ".credentials.json"} or p.startswith(".env.")
                                  for p in part.parts):
         raise ValueError("Path is outside the permitted workspace.")
     target = (root / part).resolve()
@@ -64,13 +68,17 @@ def safe_path(root: Path, relative: str):
 class Agent:
     def __init__(self, config, store, deepseek, telegram):
         self.config, self.store, self.deepseek, self.telegram = config, store, deepseek, telegram
-        self.jobs, self.approvals, self.read_cache = {}, {}, {}
+        self.jobs, self.approvals, self.read_cache, self.questions = {}, {}, {}, {}
+        self.local = None
+        self.workspace_service = None
+        self._project_guidance = {}
         self.slots = asyncio.Semaphore(4)
 
     def workspace(self, sid):
-        if not self.store.session(sid):
+        session = self.store.session(sid)
+        if not session:
             raise ValueError("Unknown session.")
-        path = self.config.root / "workspaces" / sid
+        path = Path(session["workspace"]) if session.get("workspace") else self.config.root / "workspaces" / sid
         path.mkdir(parents=True, exist_ok=True)
         return path.resolve()
 
@@ -81,7 +89,8 @@ class Agent:
         if sum(not t.done() for t in self.jobs.values()) >= 24:
             raise ValueError("Очередь заполнена. Повторите позже.")
         self.store.execute("UPDATE sessions SET status='running' WHERE id=?", (sid,))
-        task = asyncio.create_task(self.run(session, content))
+        runner = self.local.run if self.local and session.get("provider", "deepseek") != "deepseek" else self.run
+        task = asyncio.create_task(runner(session, content))
         self.jobs[sid] = task
         task.add_done_callback(lambda t: self.jobs.pop(sid, None) if self.jobs.get(sid) is t else None)
 
@@ -96,6 +105,33 @@ class Agent:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        if self.local:
+            await self.local.close()
+        if self.workspace_service:
+            await self.workspace_service.close()
+
+    async def ask(self, session, questions):
+        qid = secrets.token_hex(8)
+        future = asyncio.get_running_loop().create_future()
+        self.questions[qid] = {"future": future, "session": session, "questions": questions}
+        self.store.event(session["id"], "question", {"id": qid, "questions": questions})
+        try:
+            await self.telegram.text(session, "Нужен ответ:\n" + "\n".join(q.get("question", "") for q in questions) +
+                                     f"\nОтветьте: /answer {qid} ваш ответ")
+            return await asyncio.wait_for(future, 1800)
+        except asyncio.TimeoutError:
+            return {}
+        finally:
+            self.questions.pop(qid, None)
+            self.store.event(session["id"], "question_closed", {"id": qid})
+
+    def answer(self, qid, answers, user_id=None, admin=False):
+        item = self.questions.get(qid)
+        if not item or item["future"].done():
+            raise ValueError("Вопрос уже закрыт")
+        if not admin and item["session"]["user_id"] != user_id:
+            raise ValueError("Ответить может только владелец сессии")
+        item["future"].set_result(answers)
 
     async def tell(self, session, text, kind="assistant"):
         session.update(self.store.session(session["id"]))
@@ -134,19 +170,41 @@ class Agent:
         if removed:
             self.read_cache.pop(sid, None)
             self.store.event(sid, "context", {"text": f"Из контекста исключено сообщений: {removed}. История сохранена."})
-        return [{"role": "system", "content": SYSTEM}] + history
+        if sid not in self._project_guidance:
+            root = self.workspace(sid)
+            private = {".local", ".git", ".venv", "node_modules", ".aigent", ".codex", ".claude", "__pycache__"}
+            names = sorted(p.name + ("/" if p.is_dir() else "") for p in root.iterdir() if p.name not in private and not p.is_symlink())[:80]
+            guidance = f"Selected workspace: {root}\nTop-level project files: {', '.join(names)}\n"
+            for name in ("AGENTS.md", "CLAUDE.md"):
+                path = safe_path(root, name)
+                if path.is_file() and path.stat().st_size <= 40000:
+                    content = self.config.redact(path.read_text(encoding="utf-8"))
+                    guidance += f"\nProject guidance from {name}:\n{content}\n"
+                    self.store.event(sid, "context", {"text": "Загружены правила проекта: " + name})
+            self._project_guidance[sid] = guidance
+        return [{"role": "system", "content": SYSTEM}, {"role": "user", "content": self._project_guidance[sid]}] + history
 
     async def run(self, session, content):
         sid = session["id"]
+        self._project_guidance.pop(sid, None)
+        usage_before = self.store.usage(sid)
+        last_tg, tg_id = 0., None
         try:
             async with self.slots:
+                backend = self.deepseek
+                if isinstance(backend, DeepSeek):
+                    options = dict(self.config.values)
+                    options["model"] = session.get("model") or self.config["model"]
+                    account_id = session.get("account_id", "deepseek-default")
+                    options["deepseek_key"] = self.config["deepseek_key"] if account_id == "deepseek-default" else self.config["account_keys"].get(account_id, "")
+                    backend = DeepSeek(options, backend.client)
                 self.repair_history(sid)
                 self.store.message(sid, {"role": "user", "content": content})
                 self.store.event(sid, "user", {"text": content if isinstance(content, str) else
                                                "\n".join(p["text"] for p in content if p["type"] == "text")})
                 for _step in range(self.config["max_steps"]):
                     stream_id = secrets.token_hex(6)
-                    last_event, last_tg, tg_id = 0., 0., None
+                    last_event = 0.
                     async def delta(text, reasoning, stream_id=stream_id):
                         nonlocal last_event, last_tg, tg_id
                         now = time.monotonic()
@@ -166,39 +224,38 @@ class Agent:
                             except ProviderError:
                                 pass
                             last_tg = now
-                    message, usage = await self.deepseek.complete(self.context(sid), TOOLS, delta)
+                    tools = TOOLS
+                    if self.workspace_service:
+                        from .workspace import EXTRA_TOOLS
+                        tools = TOOLS + EXTRA_TOOLS
+                    message, usage = await backend.complete(self.context(sid), tools, delta)
                     self.store.event(sid, "stream", {"id": stream_id, "text": message.get("content") or "",
                                                      "reasoning": message.get("reasoning_content") or "", "done": True})
-                    if tg_id:
-                        try:
-                            await self.telegram.call("editMessageText", {"chat_id": session["chat_id"],
-                                                      "message_id": tg_id, "text": "✓ Поток завершён. Полные размышления — в админке."})
-                        except ProviderError:
-                            pass
                     self.store.message(sid, message)
                     if usage:
+                        usage.update(provider="deepseek", account_id=session.get("account_id", "deepseek-default"), billing="api")
                         self.store.add_usage(sid, usage)
                     else:
                         self.store.event(sid, "error", {"text": "API не прислал usage; расход этого запроса неизвестен."})
-                    if message.get("content"):
-                        await self.tell(session, message["content"])
-                    if usage:
-                        await self.telegram.text(session, usage_text(usage))
                     calls = message.get("tool_calls", [])
+                    if message.get("content"):
+                        if calls:
+                            self.store.event(sid, "assistant", {"text": message["content"], "phase": "commentary"})
+                        else:
+                            await self.tell(session, message["content"])
                     if not calls:
                         break
                     for call in calls:
                         name = call["function"]["name"]
                         try:
                             args = json.loads(call["function"]["arguments"])
-                            self.store.event(sid, "tool", {"name": name, "arguments": args})
-                            await self.telegram.text(session, f"⚙️ {name}: {str(args.get('path', args.get('query', args.get('argv', ''))))[:200]}")
+                            self.store.event(sid, "tool", {"name": name, "arguments": args, "call_id": call["id"]})
                             result = await self.execute(session, name, args)
                         except (ValueError, OSError, ProviderError, TypeError, KeyError) as exc:
                             result = {"error": self.config.redact(exc)}
                         self.store.message(sid, {"role": "tool", "tool_call_id": call["id"],
                                                  "content": json.dumps(result, ensure_ascii=False)})
-                        self.store.event(sid, "tool_result", {"name": name, "result": result})
+                        self.store.event(sid, "tool_result", {"name": name, "result": result, "call_id": call["id"]})
                 else:
                     await self.tell(session, "Достигнут лимит шагов агента. Отправьте продолжение для следующего хода.", "notice")
         except asyncio.CancelledError:
@@ -212,6 +269,17 @@ class Agent:
                 pass
         finally:
             self.store.execute("UPDATE sessions SET status='idle' WHERE id=?", (sid,))
+            self.store.event(sid, "turn_completed", {})
+            self._project_guidance.pop(sid, None)
+            after = self.store.usage(sid)
+            usage = {key: after[key] - usage_before[key] for key in ("requests", "prompt_tokens", "completion_tokens", "cache_hit_tokens", "cache_miss_tokens", "cost_usd", "saved_usd", "unknown_cache_requests", "unpriced_requests")}
+            try:
+                if tg_id:
+                    await self.telegram.call("editMessageText", {"chat_id": session["chat_id"], "message_id": tg_id, "text": "✓ Ход завершён. Подробности сохранены в AIGent."})
+                if usage["requests"]:
+                    await self.telegram.text(session, usage_text(usage))
+            except ProviderError:
+                pass
 
     async def approve(self, session, name, detail, admin_only=False):
         aid = secrets.token_hex(8)
@@ -249,12 +317,14 @@ class Agent:
         self.store.event(item["session"]["id"], "decision", {"id": aid, "accepted": accepted})
 
     async def execute(self, session, name, args):
+        if self.workspace_service and name in ("exec_command", "write_stdin", "apply_patch", "update_plan", "request_user_input"):
+            return await self.workspace_service.execute(session, name, args)
         sid = session["id"]
         root = self.workspace(sid)
         if name == "list_files":
             target = safe_path(root, args["path"])
             return {"files": [p.name + ("/" if p.is_dir() else "") for p in sorted(target.iterdir())
-                               if not p.is_symlink()][:300]}
+                               if not p.is_symlink() and p.name not in {".local", ".git", ".venv", "node_modules", ".aigent", ".codex", ".claude", "__pycache__"}][:300]}
         if name == "read_file":
             path = safe_path(root, args["path"])
             if path.stat().st_size > 200000:

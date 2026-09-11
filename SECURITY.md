@@ -1,6 +1,6 @@
 # Security policy
 
-AIGent 0.1 is a local, owner-operated preview. Do not expose its admin HTTP port to the public internet without TLS and appropriate network controls. All connector API keys have owner-level access.
+AIGent 0.2 is a local, owner-operated preview. Do not expose its admin HTTP port to the public internet without TLS and appropriate network controls. All connector API keys have owner-level access.
 
 - Never put real credentials, chat history, attachments, `.local/`, `.env` files or private workspaces in an issue, commit or screenshot.
 - Password verification uses scrypt with a unique salt. Admin cookies are HTTP-only, SameSite Strict and expire after 12 hours; HTTPS cookies are Secure. Cookie mutations require a custom same-origin request header.

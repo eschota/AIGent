@@ -2,7 +2,7 @@
 const $ = (id) => document.getElementById(id);
 const fmt = (n) => n == null ? '—' : Number(n).toLocaleString('ru-RU');
 const money = (n) => n == null ? '—' : '$' + Number(n).toFixed(6);
-let current = null, source = null, allSessions = [], setupToken = '', refreshTimer, seen = new Set(), streamNodes = new Map(), readSaved = 0;
+let current = null, source = null, allSessions = [], setupToken = '', refreshTimer, seen = new Set(), turnView = null, readSaved = 0, sessionSignature='';
 const el = (tag, text, cls) => {const n = document.createElement(tag); if (text !== undefined) n.textContent = text; if (cls) n.className = cls; return n;};
 $('usage-panel').prepend(document.querySelector('.metrics'));
 $('pending-actions').append($('approvals'));
@@ -66,11 +66,13 @@ async function refresh() {
     $('telegram-link').href = 'https://t.me/' + status.username;
     $('group-link').href = 'https://t.me/' + status.username + '?startgroup=aigent&admin=manage_topics';
   }
-  $('sessions').replaceChildren(...sessions.map(s => {
+  const nextSignature=JSON.stringify([current?.id,sessions.map(s=>[s.id,s.title,s.status])]);
+  if(nextSignature!==sessionSignature){sessionSignature=nextSignature;$('sessions').replaceChildren(...sessions.map(s => {
     const button = el('button', undefined, 'session-item' + (current?.id === s.id ? ' selected' : ''));
+    button.dataset.sessionId=s.id;
     button.append(el('span', s.title), el('small', `${s.chat_id ? 'Telegram' : 'Web / API'} · ${s.status}`));
     button.onclick = handle(() => selectSession(s)); return button;
-  }));
+  }));}
   const selected = sessions.find(s => s.id === current?.id);
   if (selected) {current = selected; updateSessionStats(selected.usage);}
   const busy = selected && ['running','approval'].includes(selected.status);
@@ -85,7 +87,7 @@ function updateSessionStats(u) {
   setText('session-info', `${current.id}\n${current.chat_id ? 'Telegram topic ' + current.topic_id : 'Локальная сессия'} · ${current.status}`);
 }
 async function selectSession(session) {
-  if (source) source.close(); current = session; seen = new Set(); streamNodes = new Map(); readSaved = 0;
+  if (source) source.close(); current = session; seen = new Set(); turnView = null; readSaved = 0;
   if (window.innerWidth<=700) document.body.classList.remove('sidebar-collapsed');
   $('events').replaceChildren(); $('empty').hidden = true; setText('session-title', session.title); setText('read-saved', '0 символов');
   let cursor = 0;
@@ -97,7 +99,54 @@ async function selectSession(session) {
   source.onmessage = (event) => renderEvent(JSON.parse(event.data));
   source.onerror = () => { /* EventSource reconnects using Last-Event-ID. */ };
   await refresh(); await Promise.all([loadFiles(), loadUsage()]);
+  if(current.status==='idle')finishTurn();
   $('chat-panel').scrollTop = $('chat-panel').scrollHeight;
+}
+function ensureTurn() {
+  if(turnView)return turnView;
+  const root=el('section',undefined,'agent-turn');
+  const reasoning=el('details',undefined,'turn-reasoning');reasoning.hidden=true;
+  reasoning.append(el('summary','Размышления'),el('pre',''));reasoning.open=true;
+  const work=el('details',undefined,'turn-work');work.hidden=true;
+  const summary=el('summary','Работа с проектом'),actions=el('div',undefined,'turn-actions');work.append(summary,actions);
+  const answer=el('div',undefined,'turn-messages'),usage=el('div',undefined,'turn-usage');usage.hidden=true;
+  root.append(reasoning,work,answer,usage);$('events').append(root);
+  turnView={root,reasoning,work,summary,actions,answer,usage,streams:new Map(),tools:[],metrics:[],done:false};
+  return turnView;
+}
+function updateWork(t) {
+  const failed=t.tools.filter(x=>x.failed).length,pending=t.tools.filter(x=>!x.done).length;
+  t.summary.textContent=`${t.done?'Выполнено':'Работа с проектом'} · ${fmt(t.tools.length)} действий`+(pending&&!t.done?` · ${pending} в работе`:'')+(failed?` · ошибок: ${failed}`:'');
+  t.summary.classList.toggle('has-errors',!!failed);
+}
+function finishTurn() {
+  if(!turnView||turnView.done)return;
+  turnView.done=true;turnView.reasoning.open=false;
+  turnView.reasoning.querySelector('summary').textContent='Размышления · завершено';
+  for(const stream of turnView.streams.values())stream.preview.remove();
+  updateWork(turnView);
+}
+function renderTurnUsage(t,p) {
+  t.metrics.push(p);t.usage.hidden=false;
+  const sum=key=>t.metrics.reduce((n,m)=>n+(Number(m[key])||0),0);
+  const known=key=>t.metrics.every(m=>m[key]!=null);
+  const input=sum('prompt_tokens'),hit=sum('cache_hit_tokens');
+  const cache=known('cache_hit_tokens')?`${fmt(hit)}${input?' ('+(100*hit/input).toFixed(0)+'%)':''}`:'—';
+  const subscription=t.metrics.every(m=>m.billing==='subscription');
+  t.usage.textContent=(t.metrics.every(m=>m.inherited)?'До форка · ':'')+`${fmt(t.metrics.length)} запросов · Вход ${fmt(input)} · Выход ${fmt(sum('completion_tokens'))} · Кеш ${cache}`+(subscription?' · Подписка':` · ≈ ${known('cost_usd')?money(sum('cost_usd')):'—'} · Сэкономлено ≈ ${known('saved_usd')?money(sum('saved_usd')):'—'}`);
+  t.usage.title='Итого за этот ход. Подробные данные по запросам — во вкладке «Токены».';
+}
+const toolNames={list_files:'Список файлов',search_files:'Поиск',read_file:'Чтение файла',write_file:'Запись файла',apply_patch:'Изменение файлов',exec_command:'Команда',run_command:'Команда',write_stdin:'Вывод команды',commandExecution:'Команда',fileChange:'Изменение файлов'};
+function renderTool(t,p,isResult) {
+  const id=p.call_id||p.arguments?.id||p.result?.id;
+  let item=id?t.tools.find(x=>x.id===id):null;
+  if(!item&&isResult&&!id)item=t.tools.find(x=>!x.done&&x.name===p.name);
+  if(!item){const row=el('details',undefined,'turn-tool'),label=el('summary'),body=el('div');row.append(label,body);t.actions.append(row);item={id,name:p.name,row,label,body,done:false};t.tools.push(item);}
+  if(!isResult){item.args=p.arguments||{};item.body.append(el('pre',JSON.stringify(item.args,null,2)));}
+  else {item.done=true;item.failed=!!(p.result?.error||p.result?.is_error||p.result?.status==='failed'||(p.result?.exit_code!=null&&p.result.exit_code!==0));item.body.append(el('pre',typeof p.result==='string'?p.result:JSON.stringify(p.result,null,2)));}
+  const a=item.args||{},target=a.path||a.pattern||a.query||a.command||a.cmd||'';
+  item.label.textContent=(item.done?(item.failed?'! ':'✓ '):'◌ ')+(toolNames[item.name]||item.name)+(target?' · '+String(target).slice(0,150):'');
+  item.label.classList.toggle('has-errors',!!item.failed);t.work.hidden=false;updateWork(t);
 }
 function renderEvent(event) {
   if (seen.has(event.id)) return; seen.add(event.id);
@@ -105,29 +154,31 @@ function renderEvent(event) {
   if (kind === 'read_cache') {readSaved += p.avoided_chars; setText('read-saved', fmt(readSaved) + ' символов');}
   if (['approval', 'approval_closed', 'decision', 'read_cache'].includes(kind)) return;
   const nearBottom = $('chat-panel').scrollHeight - $('chat-panel').scrollTop - $('chat-panel').clientHeight < 160;
-  let node;
+  if(kind==='user'){finishTurn();turnView=null;const node=el('article',undefined,'event user');node.append(el('pre',p.text||''));$('events').append(node);}
+  else if(kind==='turn_completed')finishTurn();
+  else {
+  const t=ensureTurn();let node;
   if (kind === 'stream') {
-    node = streamNodes.get(p.id);
-    if (!node) {
-      node = el('article', undefined, 'event stream');
-      const details = el('details'); details.open = true; details.append(el('summary', 'Размышления DeepSeek'), el('pre', ''));
-      node.append(details, el('pre', '', 'answer')); streamNodes.set(p.id, node); $('events').append(node);
-    }
-    const details = node.querySelector('details'); details.hidden = !p.reasoning; details.querySelector('pre').textContent = p.reasoning || '';
-    node.querySelector('.answer').textContent = p.done ? '' : p.text || '';
-    if (p.done) {details.querySelector('summary').textContent = 'Размышления DeepSeek · завершено'; details.open = false;}
+    let stream=t.streams.get(p.id);
+    if(!stream){stream={reasoning:'',preview:el('pre','', 'live-answer')};t.streams.set(p.id,stream);t.answer.append(stream.preview);}
+    if(p.reasoning)stream.reasoning=p.reasoning;
+    const reasoning=[...t.streams.values()].map(x=>x.reasoning).filter(Boolean).join('\n\n');
+    t.reasoning.hidden=!reasoning;t.reasoning.querySelector('pre').textContent=reasoning;
+    stream.preview.textContent=p.done?'':p.text||'';
+  } else if(kind==='usage')renderTurnUsage(t,p);
+  else if(kind==='tool'||kind==='tool_result')renderTool(t,p,kind==='tool_result');
+  else if(['context','provider_session','telegram_payload'].includes(kind)){
+    const detail=el('details',undefined,'turn-detail');detail.append(el('summary',p.text||'Данные подключения'),el('pre',JSON.stringify(p,null,2)));t.actions.append(detail);t.work.hidden=false;
   } else {
     node = el('article', undefined, 'event ' + kind);
-    const names = {user:'ВЫ', assistant:'DEEPSEEK', tool:'ДЕЙСТВИЕ', tool_result:'РЕЗУЛЬТАТ', media:'ВЛОЖЕНИЕ', error:'ОШИБКА', context:'КОНТЕКСТ', notice:'СОБЫТИЕ', usage:'USAGE'};
+    const names = {user:'ВЫ', assistant:(p.provider||current?.provider||'deepseek').toUpperCase(), tool:'ДЕЙСТВИЕ', tool_result:'РЕЗУЛЬТАТ', media:'ВЛОЖЕНИЕ', error:'ОШИБКА', context:'КОНТЕКСТ', notice:'СОБЫТИЕ', usage:'USAGE'};
     const label = el('div', names[kind] || kind.toUpperCase(), 'event-label'); label.append(el('time', new Date(event.created * 1000).toLocaleTimeString())); node.append(label);
-    if (kind === 'usage') {node.append(el('span', `Input ${fmt(p.prompt_tokens)} · cache read ${fmt(p.cache_hit_tokens)} · miss ${fmt(p.cache_miss_tokens)} · output ${fmt(p.completion_tokens)} · ≈ ${money(p.cost_usd)} · saved ≈ ${money(p.saved_usd)}`));}
-    else if (['tool', 'tool_result', 'telegram_payload'].includes(kind)) {
-      const details = el('details'); details.append(el('summary', p.name || kind), el('pre', JSON.stringify(p.arguments || p.result || p, null, 2))); node.append(details);
-    } else if (kind === 'media' && p.path) {
+    if (kind === 'media' && p.path) {
       const a = el('a', p.path); a.href = `/api/sessions/${current.id}/file?path=${encodeURIComponent(p.path)}`; node.append(a, el('small', ' · ' + p.direction));
     } else if (kind === 'assistant') {const body=el('div',undefined,'rich-message');richText(body,p.text||'');node.append(body);}
     else node.append(el('pre', p.text || JSON.stringify(p, null, 2)));
-    $('events').append(node);
+    t.answer.append(node);
+  }
   }
   if (nearBottom) $('chat-panel').scrollTop = $('chat-panel').scrollHeight;
 }

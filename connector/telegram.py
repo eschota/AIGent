@@ -8,6 +8,7 @@ from .config import verify_password
 from .providers import ProviderError, usage_text
 
 HELP = ("AIGent\n/new [название] — новая сессия / топик\n"
+        "/providers — выбрать аккаунт Codex / Claude / DeepSeek\n"
         "/sessions — ваши сессии\n/resume ID — продолжить сессию\n"
         "/usage — токены и экономия\n/balance — баланс API\n/stop — остановить ход\n"
         "/logout — выйти\nОтправляйте текст, изображения, документы, аудио и видео.\n"
@@ -40,6 +41,16 @@ class Bot:
             try:
                 if not self.authorized(callback["from"]["id"]):
                     raise ValueError("Сначала авторизуйтесь в личном чате.")
+                if callback.get("data", "").startswith("provider:"):
+                    account = self.store.account(callback["data"].partition(":")[2])
+                    if not account:
+                        raise ValueError("Аккаунт не найден")
+                    self.store.set_state("account:" + str(callback["from"]["id"]), account["id"])
+                    await self.api.call("answerCallbackQuery", {"callback_query_id": callback["id"], "text": "Выбран " + account["name"][:100]})
+                    message = callback["message"]
+                    await self.api.text({"chat_id": message["chat"]["id"], "topic_id": message.get("message_thread_id", 0)},
+                                        account["name"] + " выбран. Отправьте /new название для нового чата.")
+                    return
                 prefix, aid, decision = callback.get("data", "").split(":")
                 if prefix != "approve" or decision not in ("yes", "no"):
                     raise ValueError("Неизвестная кнопка.")
@@ -108,7 +119,14 @@ class Bot:
                 self.agent.stop(item["id"])
             await self.api.text(session, "Вы вышли. Для нового входа введите пароль в личном чате.")
         elif command == "/new":
-            title = argument or "Новая сессия"
+            aid = self.store.get_state("account:" + str(uid), "deepseek-default")
+            first, _, rest = argument.partition(" ")
+            if first in ("codex", "claude", "deepseek"):
+                aid, argument = first + "-default", rest
+            elif self.store.account(first):
+                aid, argument = first, rest
+            account = self.store.account(aid) or self.store.account("deepseek-default")
+            title = argument or "Новая сессия · " + account["provider"]
             new_topic = 0
             try:
                 created = await self.api.call("createForumTopic", {"chat_id": chat["id"], "name": title[:128]})
@@ -117,13 +135,28 @@ class Bot:
                 await self.api.text(session, "Telegram не разрешил создать топик. Создаю отдельную сессию в текущем чате. "
                                     "Для топиков включите Topic Mode у BotFather; в группе нужны права управления топиками.")
             target = self.store.resolve(chat["id"], new_topic or topic, uid, title, new=True)
-            await self.api.text(target, f"Новая сессия: {target['id']} · {title}\nКонтекст и рабочая папка пустые.")
+            target = self.store.update_session(target["id"], provider=account["provider"], account_id=account["id"])
+            await self.api.text(target, f"Новая сессия: {target['id']} · {title}\nАккаунт: {account['name']}\nКонтекст и рабочая папка пустые.")
+        elif command == "/providers":
+            accounts = self.store.accounts()
+            buttons = [[{"text": (a["provider"].capitalize() + " · " + a["name"])[:60],
+                         "callback_data": "provider:" + a["id"]}] for a in accounts]
+            await self.api.text(session, "Выберите аккаунт для следующего чата. Затем отправьте /new название.",
+                                reply_markup={"inline_keyboard": buttons})
+        elif command == "/answer":
+            qid, _, answer = argument.partition(" ")
+            question = self.agent.questions.get(qid)
+            if not question or not answer:
+                await self.api.text(session, "Формат: /answer ID ваш ответ. ID указан в вопросе агента.")
+            else:
+                self.agent.answer(qid, {q["id"]: answer for q in question["questions"]}, user_id=uid)
+                await self.api.text(session, "Ответ передан агенту.")
         elif command == "/sessions":
-            rows = self.store.rows("SELECT * FROM sessions WHERE user_id=? AND chat_id=? ORDER BY created DESC LIMIT 20", (uid, chat["id"]))
+            rows = self.store.rows("SELECT * FROM sessions WHERE user_id=? AND chat_id=? AND deleted=0 ORDER BY created DESC LIMIT 20", (uid, chat["id"]))
             await self.api.text(session, "\n".join(f"{r['id']} · {r['title']} · topic {r['topic_id']}" for r in rows))
         elif command == "/resume":
             target = self.store.session(argument)
-            if not target or target["user_id"] != uid or target["chat_id"] != chat["id"]:
+            if not target or target["deleted"] or target["user_id"] != uid or target["chat_id"] != chat["id"]:
                 await self.api.text(session, "Сессия не найдена.")
             elif target["topic_id"] != topic:
                 await self.api.text(session, f"Откройте топик {target['topic_id']}; его контекст привязан к этому топику.")
@@ -135,6 +168,12 @@ class Bot:
             await self.api.text(session, usage_text(self.store.usage(sid)))
         elif command == "/balance":
             try:
+                if session.get("provider", "deepseek") != "deepseek":
+                    status = await self.agent.local.status(self.store.account(session["account_id"]), True)
+                    limits = status.get("limits")
+                    await self.api.text(session, "Подписка " + session["provider"] + ":\n" +
+                        (json.dumps(limits, ensure_ascii=False, indent=2) if limits else "Провайдер пока не сообщил лимиты. Данные не приравниваются к нулевому расходу."))
+                    return
                 balance = await self.balance()
                 await self.api.text(session, "Баланс общего API-аккаунта:\n" + "\n".join(
                     f"{b['currency']}: {b['total_balance']}" for b in balance.get("balance_infos", [])))
@@ -200,6 +239,7 @@ class Bot:
                         {"command": c, "description": d} for c, d in (
                             ("start", "Начать работу / авторизация"), ("new", "Новая сессия"),
                             ("sessions", "Список сессий"), ("usage", "Токены и кеш"),
+                            ("providers", "Аккаунты Codex / Claude / DeepSeek"),
                             ("balance", "Баланс DeepSeek"), ("stop", "Остановить"), ("help", "Помощь"),
                             ("logout", "Выйти"))]})
                     token = self.config["telegram_token"]

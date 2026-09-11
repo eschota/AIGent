@@ -5,7 +5,7 @@ import uuid
 
 
 class Store:
-    def __init__(self, path):
+    def __init__(self, path, recover=False):
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.executescript("""
@@ -23,10 +23,26 @@ class Store:
           id INTEGER PRIMARY KEY, session_id TEXT, payload TEXT, created REAL);
         CREATE TABLE IF NOT EXISTS inbox (
           id INTEGER PRIMARY KEY, payload TEXT, status TEXT DEFAULT 'pending');
+        CREATE TABLE IF NOT EXISTS accounts (
+          id TEXT PRIMARY KEY, provider TEXT, name TEXT, auth_path TEXT, browser_profile TEXT,
+          created REAL, metadata TEXT DEFAULT '{}');
+        CREATE TABLE IF NOT EXISTS projects (
+          id TEXT PRIMARY KEY, name TEXT, path TEXT UNIQUE, created REAL);
         CREATE INDEX IF NOT EXISTS events_session ON events(session_id, id);
         CREATE INDEX IF NOT EXISTS messages_session ON messages(session_id, id);
         """)
-        self.db.execute("UPDATE sessions SET status='interrupted' WHERE status IN ('running','approval')")
+        columns = {r[1] for r in self.db.execute("PRAGMA table_info(sessions)")}
+        for name, definition in {"provider": "TEXT DEFAULT 'deepseek'", "account_id": "TEXT DEFAULT 'deepseek-default'",
+                                 "external_id": "TEXT", "model": "TEXT DEFAULT ''", "effort": "TEXT DEFAULT 'medium'",
+                                 "workspace": "TEXT", "project_id": "TEXT", "archived": "INTEGER DEFAULT 0",
+                                 "pinned": "INTEGER DEFAULT 0", "forked": "INTEGER DEFAULT 0", "deleted": "INTEGER DEFAULT 0"}.items():
+            if name not in columns:
+                self.db.execute(f"ALTER TABLE sessions ADD COLUMN {name} {definition}")
+        for provider in ("deepseek", "codex", "claude"):
+            self.db.execute("INSERT OR IGNORE INTO accounts(id,provider,name,created) VALUES (?,?,?,?)",
+                            (provider + "-default", provider, provider.capitalize() + " · текущий аккаунт", time.time()))
+        if recover:
+            self.db.execute("UPDATE sessions SET status='interrupted' WHERE status IN ('running','approval')")
         self.db.commit()
 
     def rows(self, sql, args=()):
@@ -48,13 +64,29 @@ class Store:
         rows = self.rows("SELECT * FROM sessions WHERE id=?", (sid,))
         return rows[0] if rows else None
 
-    def sessions(self):
-        return self.rows("SELECT * FROM sessions ORDER BY created DESC LIMIT 300")
+    def sessions(self, archived=False, deleted=False):
+        if deleted:
+            return self.rows("SELECT * FROM sessions WHERE deleted=1 ORDER BY created DESC LIMIT 300")
+        return self.rows("SELECT * FROM sessions WHERE archived=? AND deleted=0 ORDER BY pinned DESC,created DESC LIMIT 300", (int(archived),))
+
+    def account(self, aid):
+        rows = self.rows("SELECT * FROM accounts WHERE id=?", (aid,))
+        return rows[0] if rows else None
+
+    def accounts(self):
+        return self.rows("SELECT * FROM accounts ORDER BY created")
+
+    def update_session(self, sid, **fields):
+        allowed = {"title", "provider", "account_id", "external_id", "model", "effort", "workspace", "project_id", "archived", "pinned", "forked", "deleted"}
+        if not fields or not set(fields) <= allowed:
+            raise ValueError("Invalid session fields")
+        self.execute("UPDATE sessions SET " + ",".join(f"{key}=?" for key in fields) + " WHERE id=?", (*fields.values(), sid))
+        return self.session(sid)
 
     def resolve(self, chat, topic, user, title="New session", new=False):
         args = (chat, topic or 0, user)
         rows = self.rows("SELECT * FROM sessions WHERE chat_id=? AND topic_id=? AND user_id=? "
-                         "AND active=1 ORDER BY created DESC LIMIT 1", args)
+                         "AND active=1 AND deleted=0 ORDER BY created DESC LIMIT 1", args)
         if rows and not new:
             return rows[0]
         self.execute("UPDATE sessions SET active=0 WHERE chat_id=? AND topic_id=? AND user_id=?", args)

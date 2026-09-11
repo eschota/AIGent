@@ -1,8 +1,10 @@
 import asyncio
+import hashlib
 import hmac
 import json
 import secrets
 import time
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -18,6 +20,8 @@ from .config import Config, password_hash, verify_password
 from .providers import DeepSeek, ProviderError, TelegramAPI, account_usage
 from .store import Store
 from .telegram import Bot
+from .local_providers import LocalProviders
+from .workspace import WorkspaceService
 
 
 class PasswordBody(BaseModel):
@@ -43,6 +47,59 @@ class ChatBody(BaseModel):
 
 class SessionBody(BaseModel):
     title: str = Field(default="Web session", min_length=1, max_length=100)
+    account_id: str = "deepseek-default"
+    model: str = ""
+    effort: str = "medium"
+    project_id: str | None = None
+
+
+class AccountBody(BaseModel):
+    provider: str
+    name: str = Field(min_length=1, max_length=120)
+    browser_profile: str = ""
+    api_key: str = ""
+
+
+class ProjectBody(BaseModel):
+    path: str
+    name: str = ""
+
+
+class SessionUpdate(BaseModel):
+    title: str | None = None
+    model: str | None = None
+    effort: str | None = None
+    archived: bool | None = None
+    pinned: bool | None = None
+
+
+class AnswerBody(BaseModel):
+    answers: dict[str, str | list[str]]
+
+
+class FileBody(BaseModel):
+    path: str
+    text: str = Field(max_length=1000000)
+    revision: str | None = None
+
+
+class CommandBody(BaseModel):
+    command: str = Field(min_length=1, max_length=20000)
+    workdir: str = "."
+
+
+class StdinBody(BaseModel):
+    text: str = Field(max_length=20000)
+
+
+class AccountUpdate(BaseModel):
+    browser_profile: str
+
+
+class GitBody(BaseModel):
+    action: str
+    paths: list[str] = []
+    message: str = ""
 
 
 class DecisionBody(BaseModel):
@@ -63,10 +120,14 @@ class CompletionBody(BaseModel):
 
 def create_app(root: Path | None = None, polling=True):
     config = Config(root or Path(__file__).resolve().parents[1] / ".local")
-    store = Store(config.root / "sessions.sqlite3")
+    store = Store(config.root / "sessions.sqlite3", recover=True)
     client = httpx.AsyncClient()
     telegram = TelegramAPI(config, client)
     agent = Agent(config, store, DeepSeek(config, client), telegram)
+    local = LocalProviders(agent)
+    agent.local = local
+    workspace_service = WorkspaceService(agent)
+    agent.workspace_service = workspace_service
     bot = Bot(config, store, telegram, agent)
     sessions, failures = {}, {}
 
@@ -82,7 +143,7 @@ def create_app(root: Path | None = None, polling=True):
         await client.aclose()
         store.db.close()
 
-    app = FastAPI(title="AIGent", version="0.1.0", lifespan=lifespan,
+    app = FastAPI(title="AIGent", version="0.2.0", lifespan=lifespan,
                   description="Local agent connector. Authenticate with the admin cookie or connector Bearer token.")
     app.state.config, app.state.store, app.state.agent, app.state.bot = config, store, agent, bot
     app.state.client = client
@@ -99,7 +160,7 @@ def create_app(root: Path | None = None, polling=True):
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["Cache-Control"] = "no-store"
         if request.url.path == "/":
-            response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'"
+            response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'"
         return response
 
     def bearer(request):
@@ -116,7 +177,7 @@ def create_app(root: Path | None = None, polling=True):
 
     def require_session(sid):
         session = store.session(sid)
-        if not session:
+        if not session or session.get("deleted"):
             raise HTTPException(404, "Session not found")
         return session
 
@@ -130,7 +191,19 @@ def create_app(root: Path | None = None, polling=True):
 
     @app.get("/healthz")
     async def health():
-        return {"status": "ok", "configured": config.ready}
+        return {"status": "ok", "service": "aigent", "version": "0.2.0", "configured": config.ready}
+
+    @app.get("/api/identity")
+    async def identity(nonce: str):
+        if len(nonce) > 128:
+            raise HTTPException(400, "Invalid challenge")
+        return {"signature": hmac.new(config["connector_token"].encode(), ("aigent:" + nonce).encode(), hashlib.sha256).hexdigest()}
+
+    @app.post("/api/desktop/session", dependencies=[Depends(require_admin)])
+    async def desktop_session():
+        token = secrets.token_urlsafe(32)
+        sessions[token] = (time.time() + 43200, config["admin_password"])
+        return {"cookie": token, "expires": time.time() + 43200}
 
     @app.get("/api/bootstrap")
     async def bootstrap():
@@ -215,12 +288,195 @@ def create_app(root: Path | None = None, polling=True):
             raise HTTPException(502, "DeepSeek balance network error") from None
 
     @app.get("/api/sessions", dependencies=[Depends(require_admin)])
-    async def list_sessions():
-        return [s | {"usage": store.usage(s["id"])} for s in store.sessions()]
+    async def list_sessions(archived: bool = False, deleted: bool = False):
+        return [s | {"usage": store.usage(s["id"])} for s in store.sessions(archived, deleted)]
+
+    @app.delete("/api/sessions/{sid}", dependencies=[Depends(require_admin)])
+    async def delete_session(sid: str):
+        require_session(sid)
+        agent.stop(sid)
+        store.execute("UPDATE sessions SET deleted=1,active=0 WHERE id=?", (sid,))
+        return {"deleted": True, "recoverable": True, "files_preserved": True}
+
+    @app.post("/api/sessions/{sid}/restore", dependencies=[Depends(require_admin)])
+    async def restore_session(sid: str):
+        if not store.session(sid):
+            raise HTTPException(404, "Session not found")
+        return store.update_session(sid, deleted=False, archived=False)
 
     @app.post("/api/sessions", dependencies=[Depends(require_admin)])
     async def new_session(body: SessionBody):
-        return store.resolve(0, 0, 0, body.title, new=True)
+        account = store.account(body.account_id)
+        if not account:
+            raise HTTPException(404, "Account not found")
+        session = store.resolve(0, 0, 0, body.title, new=True)
+        workspace = None
+        if body.project_id:
+            projects = store.rows("SELECT * FROM projects WHERE id=?", (body.project_id,))
+            if not projects:
+                raise HTTPException(404, "Project not found")
+            workspace = projects[0]["path"]
+        return store.update_session(session["id"], provider=account["provider"], account_id=account["id"],
+            model=body.model, effort=body.effort, workspace=workspace, project_id=body.project_id)
+
+    @app.patch("/api/sessions/{sid}", dependencies=[Depends(require_admin)])
+    async def update_session(sid: str, body: SessionUpdate):
+        require_session(sid)
+        return store.update_session(sid, **body.model_dump(exclude_none=True))
+
+    @app.post("/api/sessions/{sid}/fork", dependencies=[Depends(require_admin)])
+    async def fork_session(sid: str):
+        original = require_session(sid)
+        if sid in agent.jobs:
+            raise HTTPException(409, "Wait for the current turn or stop it before forking")
+        fields = {k: original[k] for k in ("provider", "account_id", "model", "effort", "workspace", "project_id")}
+        fields["workspace"] = str(agent.workspace(sid))
+        if original["provider"] == "codex" and original.get("external_id"):
+            result = await local.rpc(store.account(original["account_id"])).call("thread/fork", {"threadId": original["external_id"]})
+            fields["external_id"] = result["thread"]["id"]
+        elif original["provider"] == "claude" and original.get("external_id"):
+            fields.update(external_id=original["external_id"], forked=True)
+        target = store.resolve(original["chat_id"], original["topic_id"], original["user_id"], original["title"] + " · fork", new=True)
+        for message in store.history(sid):
+            store.message(target["id"], message)
+        cursor = 0
+        while True:
+            events = store.events(sid, cursor)
+            for event in events:
+                store.event(target["id"], event["kind"], event["payload"] | {"inherited": True})
+            if len(events) < 500:
+                break
+            cursor = events[-1]["id"]
+        return store.update_session(target["id"], **fields)
+
+    @app.get("/api/projects", dependencies=[Depends(require_admin)])
+    async def projects():
+        return store.rows("SELECT * FROM projects ORDER BY created DESC")
+
+    @app.post("/api/projects", dependencies=[Depends(require_admin)])
+    async def add_project(body: ProjectBody):
+        path = Path(body.path).resolve()
+        if not path.is_dir():
+            raise HTTPException(400, "Select an existing project directory")
+        found = store.rows("SELECT * FROM projects WHERE path=?", (str(path),))
+        if found:
+            return found[0]
+        pid = uuid.uuid4().hex[:16]
+        store.execute("INSERT INTO projects VALUES (?,?,?,?)", (pid, body.name or path.name, str(path), time.time()))
+        return store.rows("SELECT * FROM projects WHERE id=?", (pid,))[0]
+
+    @app.get("/api/accounts", dependencies=[Depends(require_admin)])
+    async def accounts(refresh: bool = False):
+        async def describe(account):
+            if account["provider"] == "deepseek":
+                status = {"connected": bool(config["deepseek_key"] if account["id"] == "deepseek-default" else config["account_keys"].get(account["id"])),
+                          "source": "DeepSeek API", "checked_at": time.time(),
+                          "models": [{"id": "deepseek-flash"}, {"id": "deepseek-v4-pro"}]}
+            else:
+                status = await local.status(account, refresh)
+            return {k: v for k, v in account.items() if k != "metadata"} | {"status": status}
+        return await asyncio.gather(*(describe(a) for a in store.accounts()))
+
+    @app.post("/api/accounts", dependencies=[Depends(require_admin)])
+    async def add_account(body: AccountBody):
+        if body.provider not in ("codex", "claude", "deepseek"):
+            raise HTTPException(400, "Unknown provider")
+        aid = uuid.uuid4().hex[:16]
+        path = config.root / "accounts" / aid
+        path.mkdir(parents=True, exist_ok=True)
+        store.execute("INSERT INTO accounts(id,provider,name,auth_path,browser_profile,created) VALUES (?,?,?,?,?,?)",
+                      (aid, body.provider, body.name, str(path), body.browser_profile, time.time()))
+        if body.api_key:
+            config.values["account_keys"][aid] = body.api_key
+            config.save()
+        return store.account(aid)
+
+    @app.post("/api/accounts/{aid}/login", dependencies=[Depends(require_admin)])
+    async def account_login(aid: str):
+        account = store.account(aid)
+        if not account:
+            raise HTTPException(404, "Account not found")
+        if account["provider"] == "codex":
+            if not account.get("auth_path") and (await local.status(account, True)).get("connected"):
+                return {"state": "connected", "url": None, "browser_profile": account["browser_profile"]}
+            result = await local.rpc(account).call("account/login/start", {"type": "chatgpt"})
+            return {"url": result.get("authUrl"), "state": "waiting", "browser_profile": account["browser_profile"]}
+        if account["provider"] == "claude":
+            raise HTTPException(409, "Войдите в официальный Claude Code CLI для этого профиля. AIGent использует готовую CLI-авторизацию и не предоставляет вход Claude.ai через SDK.")
+        raise HTTPException(400, "DeepSeek uses an API key")
+
+    @app.patch("/api/accounts/{aid}", dependencies=[Depends(require_admin)])
+    async def update_account(aid: str, body: AccountUpdate):
+        if not store.account(aid):
+            raise HTTPException(404, "Account not found")
+        store.execute("UPDATE accounts SET browser_profile=? WHERE id=?", (body.browser_profile, aid))
+        return {"ok": True}
+
+    @app.get("/api/accounts/{aid}/login", dependencies=[Depends(require_admin)])
+    async def account_login_status(aid: str):
+        account = store.account(aid)
+        if not account:
+            raise HTTPException(404, "Account not found")
+        status = await local.status(account, True)
+        result = {"connected": status.get("connected", False), "status": status, "url": None}
+        return result
+
+    @app.get("/api/accounts/{aid}/sessions", dependencies=[Depends(require_admin)])
+    async def native_sessions(aid: str):
+        account = store.account(aid)
+        if not account:
+            raise HTTPException(404, "Account not found")
+        if account["provider"] == "codex":
+            result = await local.rpc(account).call("thread/list", {"limit": 50, "useStateDbOnly": True})
+            return [{"id": t["id"], "title": t.get("name") or t.get("preview") or t["id"],
+                     "cwd": t.get("cwd"), "status": t.get("status")} for t in result.get("data", [])]
+        if account["provider"] == "claude":
+            return await local.claude_history(account)
+        return []
+
+    @app.post("/api/accounts/{aid}/sessions/{external_id}/import", dependencies=[Depends(require_admin)])
+    async def import_native(aid: str, external_id: str):
+        account = store.account(aid)
+        if not account or account["provider"] not in ("codex", "claude"):
+            raise HTTPException(400, "Choose a local Codex or Claude account")
+        if account["provider"] == "claude":
+            history = await local.claude_history(account, external_id)
+            info = history.get("info")
+            if not info:
+                raise HTTPException(404, "Claude session not found in this account")
+            session = store.resolve(0, 0, 0, info.get("summary") or "Imported Claude fork", new=True)
+            session = store.update_session(session["id"], provider="claude", account_id=aid, external_id=external_id,
+                                           workspace=info.get("cwd"), forked=True)
+            for item in history.get("messages", []):
+                message = item.get("message", {})
+                role = message.get("role", item.get("type"))
+                content = message.get("content", "")
+                text = content if isinstance(content, str) else "\n".join(p.get("text", "") for p in content if p.get("type") == "text")
+                if role in ("user", "assistant") and text:
+                    store.event(session["id"], role, {"text": text, "provider": "claude"})
+            return session
+        result = await local.rpc(account).call("thread/fork", {"threadId": external_id})
+        thread = result["thread"]
+        session = store.resolve(0, 0, 0, thread.get("name") or "Imported Codex fork", new=True)
+        session = store.update_session(session["id"], provider="codex", account_id=aid, external_id=thread["id"], workspace=thread.get("cwd"))
+        for turn in thread.get("turns", []):
+            for item in turn.get("items", []):
+                if item["type"] == "agentMessage":
+                    store.event(session["id"], "assistant", {"text": item["text"], "provider": "codex"})
+        return session
+
+    @app.get("/api/questions", dependencies=[Depends(require_admin)])
+    async def questions():
+        return [{"id": qid, "sid": q["session"]["id"], "questions": q["questions"]} for qid, q in agent.questions.items()]
+
+    @app.post("/api/questions/{qid}", dependencies=[Depends(require_admin)])
+    async def answer(qid: str, body: AnswerBody):
+        agent.answer(qid, body.answers, admin=True)
+        return {"ok": True}
+
+    @app.post("/api/sessions/{sid}/steer", dependencies=[Depends(require_admin)])
+    async def steer(sid: str, body: ChatBody):
+        return await local.steer(require_session(sid), body.text)
 
     @app.post("/api/sessions/{sid}/topics", dependencies=[Depends(require_admin)])
     async def new_topic(sid: str, body: SessionBody):
@@ -229,6 +485,12 @@ def create_app(root: Path | None = None, polling=True):
             raise HTTPException(409, "Select a Telegram session first")
         created = await telegram.call("createForumTopic", {"chat_id": original["chat_id"], "name": body.title})
         session = store.resolve(original["chat_id"], created["message_thread_id"], original["user_id"], body.title, new=True)
+        account = store.account(body.account_id)
+        if not account:
+            raise HTTPException(404, "Account not found")
+        project = store.rows("SELECT * FROM projects WHERE id=?", (body.project_id,)) if body.project_id else []
+        session = store.update_session(session["id"], provider=account["provider"], account_id=account["id"], model=body.model,
+            effort=body.effort, project_id=body.project_id, workspace=project[0]["path"] if project else None)
         await telegram.text(session, f"AIGent · {body.title}\nСессия {session['id']} готова. Отправьте задачу.")
         return session
 
@@ -280,18 +542,66 @@ def create_app(root: Path | None = None, polling=True):
 
     @app.get("/api/sessions/{sid}/files", dependencies=[Depends(require_admin)])
     async def files(sid: str):
-        root = agent.workspace(sid)
-        result = []
-        for path in root.rglob("*"):
-            if len(result) >= 500:
-                break
-            if path.is_file():
-                try:
-                    checked = safe_path(root, path.relative_to(root).as_posix())
-                    result.append({"path": checked.relative_to(root).as_posix(), "size": checked.stat().st_size})
-                except ValueError:
-                    continue
-        return result
+        return workspace_service.files(sid)
+
+    @app.get("/api/sessions/{sid}/editor", dependencies=[Depends(require_admin)])
+    async def read_editor(sid: str, path: str):
+        require_session(sid)
+        return workspace_service.read(sid, path)
+
+    @app.put("/api/sessions/{sid}/editor", dependencies=[Depends(require_admin)])
+    async def save_editor(sid: str, body: FileBody):
+        require_session(sid)
+        return workspace_service.save(sid, body.path, body.text, body.revision)
+
+    @app.get("/api/sessions/{sid}/git", dependencies=[Depends(require_admin)])
+    async def git_status(sid: str):
+        require_session(sid)
+        return await workspace_service.git_status(sid)
+
+    @app.get("/api/sessions/{sid}/git/diff", dependencies=[Depends(require_admin)])
+    async def git_diff(sid: str, path: str = "", staged: bool = False):
+        require_session(sid)
+        if path:
+            safe_path(agent.workspace(sid), path)
+        args = ["diff"] + (["--cached"] if staged else []) + ["--"] + ([path] if path else [])
+        return {"diff": await workspace_service.git(sid, args)}
+
+    @app.post("/api/sessions/{sid}/git", dependencies=[Depends(require_admin)])
+    async def git_action(sid: str, body: GitBody):
+        require_session(sid)
+        for path in body.paths:
+            safe_path(agent.workspace(sid), path)
+        if body.action == "stage" and body.paths:
+            args = ["add", "--", *body.paths]
+        elif body.action == "unstage" and body.paths:
+            args = ["restore", "--staged", "--", *body.paths]
+        elif body.action == "commit" and body.message.strip():
+            args = ["commit", "-m", body.message]
+        else:
+            raise HTTPException(400, "Select stage, unstage or commit with the required fields")
+        result = await workspace_service.git(sid, args)
+        store.event(sid, "git", {"action": body.action, "text": result})
+        return {"result": result}
+
+    @app.post("/api/sessions/{sid}/terminal", dependencies=[Depends(require_admin)])
+    async def terminal_start(sid: str, body: CommandBody):
+        tid = await workspace_service.start_command(require_session(sid), body.command, body.workdir)
+        return {"id": tid}
+
+    @app.post("/api/sessions/{sid}/terminal/{tid}/stdin", dependencies=[Depends(require_admin)])
+    async def terminal_stdin(sid: str, tid: str, body: StdinBody):
+        item = workspace_service.command(sid, tid)
+        if item["process"].returncode is not None:
+            raise HTTPException(409, "Process has exited")
+        item["process"].stdin.write(body.text.encode())
+        await item["process"].stdin.drain()
+        return {"ok": True}
+
+    @app.post("/api/sessions/{sid}/terminal/{tid}/stop", dependencies=[Depends(require_admin)])
+    async def terminal_stop(sid: str, tid: str):
+        await workspace_service.stop_command(sid, tid)
+        return {"ok": True}
 
     @app.get("/api/sessions/{sid}/file", dependencies=[Depends(require_admin)])
     async def get_file(sid: str, path: str):

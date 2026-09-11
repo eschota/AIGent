@@ -13,3 +13,6 @@ dist/
 !.env.example
 .sites-runtime/
 *.log
+node_modules/
+desktop/release/
+*.spec

@@ -15,14 +15,30 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8787)
     parser.add_argument("--no-browser", action="store_true")
+    parser.add_argument("--data-dir", type=Path)
+    parser.add_argument("--no-telegram", action="store_true")
+    parser.add_argument("--helper", choices=["claude-history"])
+    parser.add_argument("--external-id")
     args = parser.parse_args()
-    root = Path(__file__).resolve().parent / ".local"
+    if args.helper == "claude-history":
+        import dataclasses
+        import json
+        from claude_agent_sdk import list_sessions, get_session_info, get_session_messages
+        if args.external_id:
+            info = get_session_info(args.external_id)
+            result = {"info": dataclasses.asdict(info) if info else None,
+                      "messages": [dataclasses.asdict(m) for m in get_session_messages(args.external_id, limit=100)]}
+        else:
+            result = [dataclasses.asdict(s) for s in list_sessions(limit=50)]
+        print(json.dumps(result, ensure_ascii=True))
+        return
+    root = args.data_dir.resolve() if args.data_dir else Path(__file__).resolve().parent / ".local"
     temp = root / "tmp"
     temp.mkdir(parents=True, exist_ok=True)
     os.environ.update(TEMP=str(temp), TMP=str(temp), TMPDIR=str(temp))
     import tempfile
     tempfile.tempdir = str(temp)
-    app = create_app(root)
+    app = create_app(root, polling=not args.no_telegram)
     url = f"http://127.0.0.1:{args.port}/"
     if not app.state.config.ready:
         url += "#setup=" + app.state.config["setup_token"]

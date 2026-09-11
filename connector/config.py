@@ -34,6 +34,7 @@ class Config:
             "pricing": {"deepseek-flash": [0.006, 0.3, 1.2], "deepseek-v4-pro": [0.044, 1.32, 3.96]},
             "pricing_date": "2026-09-11", "auth_epoch": 1,
             "connector_token": secrets.token_urlsafe(32),
+            "account_keys": {},
             "setup_token": secrets.token_urlsafe(32),
         }
         if self.path.exists():
@@ -56,7 +57,7 @@ class Config:
     def public(self):
         return {k: v for k, v in self.values.items() if k not in {
             "deepseek_key", "telegram_token", "admin_password", "chat_password",
-            "connector_token", "setup_token",
+            "connector_token", "setup_token", "account_keys",
         }} | {"deepseek_configured": bool(self["deepseek_key"]),
              "telegram_configured": bool(self["telegram_token"]), "ready": self.ready}
 
@@ -65,4 +66,7 @@ class Config:
         for name in ("deepseek_key", "telegram_token", "connector_token", "setup_token"):
             if self[name]:
                 text = text.replace(self[name], "[REDACTED]")
+        for secret in self["account_keys"].values():
+            if secret:
+                text = text.replace(secret, "[REDACTED]")
         return text

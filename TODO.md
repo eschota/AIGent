@@ -16,6 +16,22 @@
 
 ## Stage 2 — local Codex and Claude adapters (requested 2026-09-11)
 
+Current desktop-preview implementation:
+
+- [x] Electron window and native menus, project/account/model selection.
+- [x] Installed Codex App Server bridge with streamed turns, tool approvals, history/fork and usage/limits.
+- [x] Real Codex read-only tool turn: decline and accept paths both verified.
+- [x] Installed Claude CLI JSONL bridge and permission-host protocol; real initialize handshake verified.
+- [ ] Complete a real Claude model/tool turn with a user-authenticated official CLI profile.
+- [x] Separate local account configuration roots and browser-profile metadata selection (no cookies extracted).
+- [x] CodeMirror editor with revision checks, Git diff/staging, streaming process terminal.
+- [x] Chat context menu: fork, recoverable delete, restore; preserve project files and full history.
+- [x] Compact per-turn tools/reasoning/usage, keyboard and button zoom controls.
+- [x] Build Windows desktop folder and verify its bundled backend: startup, shared-workspace fork, delete/restore, current UI assets.
+- [ ] Native visual acceptance on the updated build and distributable release.
+
+The checklist below tracks broader integration acceptance, not absence of the preview implementation:
+
 - [ ] Discover running `codex.exe` and `claude.exe` on the PC; map PID, executable, workspace and provider.
 - [ ] Add a provider interface: discover, sessions, start/resume, send, stream, cancel, approvals, media, usage.
 - [ ] Inspect supported local Codex app-server/CLI APIs and Claude agent/SDK interfaces before choosing a bridge.

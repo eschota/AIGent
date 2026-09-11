@@ -48,4 +48,8 @@ Structured send example: `{"kind":"location","payload":{"latitude":55.0,"longitu
 
 Event types include `user`, `stream`, `assistant`, `tool`, `tool_result`, `approval`, `decision`, `approval_closed`, `media`, `usage`, `context`, `read_cache`, `error` and `notice`. Stream events carry cumulative `text` and provider `reasoning`, keyed by a stable stream `id`. Render the latest state instead of appending it as duplicate text.
 
+Desktop preview adds projects/accounts, local native history import, editor revisions, Git, terminal output, plans and user questions. See the running `/docs` for exact request schemas. `POST /api/sessions/{id}/fork` creates an independent conversation sharing the source workspace; `DELETE /api/sessions/{id}` stops and soft-deletes a chat; `GET /api/sessions?deleted=true` lists Trash and `POST /api/sessions/{id}/restore` restores it. No project files are removed.
+
+New tool events carry `call_id` to pair each invocation with its result. `turn_completed` closes a turn. The UI groups routine steps, combines per-turn usage and retains the complete ordered event journal. Forked historical events carry `inherited: true`; historical usage is displayed as preceding the fork and is not charged again to the new session.
+
 Provider reasoning is returned provider data, not reasoning authored by the connector. Pricing is estimated and raw usage is retained. Missing cache/cost values are null; aggregate counters report how many requests are unpriced or lack cache metrics.

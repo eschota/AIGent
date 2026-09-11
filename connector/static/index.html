@@ -4,7 +4,7 @@
 <title>AIGent · Agent workspace</title><meta name="description" content="Self-hosted agent workspace: Telegram, DeepSeek, live reasoning and transparent token accounting.">
 <meta property="og:title" content="AIGent"><meta property="og:description" content="Your agents. Your machine. Every token accounted for.">
 <link rel="icon" href="/static/favicon.svg" type="image/svg+xml"><link rel="stylesheet" href="/static/style.css"><link rel="stylesheet" href="/static/codex.css">
-<script src="/static/app.js" defer></script></head>
+<link rel="stylesheet" href="/static/widgets.css"><link rel="stylesheet" href="/static/desktop.css"><script src="/static/widgets.js" defer></script><script src="/static/app.js" defer></script><script src="/static/desktop-ui.js" defer></script><script src="/static/zoom.js" defer></script></head>
 <body>
 <div id="toast" role="status" aria-live="polite" hidden></div>
 <section id="login" class="gate" hidden><div class="login-card"><div class="brand"><span class="logo">A</span>AIGent</div>
@@ -12,7 +12,7 @@
 <form id="login-form"><label>Пароль администратора<input id="login-password" type="password" autocomplete="current-password" required></label><button class="primary" type="submit">Открыть рабочее пространство</button></form>
 <p class="muted">При первом запуске используйте ссылку настройки из консоли сервера.</p></div></section>
 <div id="workspace" hidden>
-<aside class="sidebar"><div class="brand"><span class="logo">A</span>AIGent <span class="version">0.1</span></div>
+<aside class="sidebar"><div class="brand"><span class="logo">A</span>AIGent <span class="version">0.2</span></div>
 <button id="new-session" class="primary">✎ Новый чат</button><div class="sidebar-label">Провайдеры</div>
 <div class="provider"><span class="provider-icon">D</span><div>DeepSeek<small id="model-label">Подключение…</small></div><span class="tag">API</span></div>
 <div class="provider future"><span class="provider-icon">C</span><div>Codex<small>Следующий этап</small></div></div>

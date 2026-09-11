@@ -6,3 +6,4 @@
 *.md text eol=lf
 *.yml text eol=lf
 *.ps1 text eol=crlf
+connector/static/widgets.* linguist-vendored=true -whitespace

@@ -9,8 +9,8 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-79edd0)](LICENSE)
 [![Self hosted](https://img.shields.io/badge/self--hosted-local--first-79edd0)](#quick-start)
 
-A small Python server that connects Telegram to a real DeepSeek coding agent.
-Live reasoning, topic sessions, reviewed file changes, media transport and honest cache accounting.
+A local agent workspace with an Electron desktop client, Python server and Telegram connection.
+DeepSeek API, local Codex App Server and independently authenticated Claude CLI profiles share sessions, streaming, reviewed tools and transparent usage.
 
 [Quick start](#quick-start) · [Русский](#русский) · [API](docs/API.md) · [Roadmap](TODO.md) · [Security](SECURITY.md)
 
@@ -26,7 +26,16 @@ Live reasoning, topic sessions, reviewed file changes, media transport and hones
 - **Media bridge:** photos, documents, audio, voice, video, video notes, animations and stickers in both directions. Other Telegram message structures are preserved in the event journal. Flash can inspect images; text files can enter context.
 - **Connector APIs:** OpenAPI-documented session/event/file endpoints and OpenAI-compatible `/v1/chat/completions` and `/v1/models` with streaming and tool-call pass-through.
 
-**Status: first-stage preview.** Codex and Claude process/chat adapters are planned, not implemented. See [TODO.md](TODO.md).
+**Status: desktop preview.** DeepSeek and local Codex tool turns have been exercised against real providers. The installed Claude CLI bridge has passed its protocol handshake; full Claude turns require an authenticated CLI profile and remain to be validated. Browser login alone does not authorize a CLI profile. See [TODO.md](TODO.md).
+
+- **Desktop tools:** project picker, CodeMirror editor with revision checks, Git diff/staging and streaming terminal output. Shell processes use pipes, not a full OS PTY.
+- **Compact activity:** one expandable tool group and reasoning panel per turn, one usage total, detailed per-request charts. Existing history is grouped too.
+- **Chat management:** right-click a chat to fork or delete it. Deleted chats can be restored from Trash; project files are preserved.
+- **Scale:** Ctrl++ / Ctrl+− / Ctrl+0, including numeric keypad, and visible − / 100% / + controls.
+
+For desktop development, install Node.js dependencies with `cd desktop && npm ci`, run `npm run install:electron`, then `npm start`. Windows builds use `scripts/build-desktop.ps1`; generated artifacts and private state stay outside Git.
+
+Local Codex and Claude connections require their official CLIs installed and authenticated separately. The desktop bundle does not redistribute these CLI executables. A fork shares its source project folder while keeping a separate conversation; usage inherited from before the fork is labelled accordingly.
 
 ## Quick start
 

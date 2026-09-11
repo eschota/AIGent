@@ -1,0 +1,18 @@
+[Unit]
+Description=AIGent Telegram and DeepSeek connector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aigent
+WorkingDirectory=/opt/AIGent
+ExecStart=/opt/AIGent/.venv/bin/python /opt/AIGent/run.py --no-browser
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -74,7 +74,7 @@ function renderAccounts(){
     if(a.status.error)detail.textContent+=' · '+a.status.error;row.append(detail);
     const limits=a.status.limits?.rateLimitsByLimitId||{};
     for(const [key,bucket] of Object.entries(limits)){for(const [windowName,window] of [['Основной',bucket.primary],['Дополнительный',bucket.secondary]]){if(!window)continue;const used=Math.max(0,Math.min(100,window.usedPercent));const wrap=el('div',undefined,'limit-row');const progress=el('progress');progress.max=100;progress.value=used;wrap.append(el('span',`${key} · ${windowName}: осталось ${(100-used).toFixed(0)}%`),progress,el('small','Сброс '+new Date(window.resetsAt*1000).toLocaleString()));row.append(wrap);}}
-    
+
     if(a.provider==='claude')row.append(el('small','Расход токенов показывается по сессиям CLI. Лимиты подписки доступны в официальном Claude Code.'));
     row.append(el('small','Проверено '+new Date(a.status.checked_at*1000).toLocaleTimeString()));
     if(a.provider!=='deepseek'){

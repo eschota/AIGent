@@ -81,13 +81,22 @@ function renderContext(data){
   contextValue.textContent=Math.round(percent)+'%';
   contextMeter.classList.toggle('warn',percent>=60&&percent<85);
   contextMeter.classList.toggle('full',percent>=85);
+  const cache=data.cache||{};
+  contextValue.textContent=Math.round(percent)+'%'+(cache.percent!=null?' · кеш '+Math.round(cache.percent)+'%':'');
   contextMeter.title=`Контекст ${compact(data.chars)} / ${compact(data.limit)} символов (${percent}%)`
     +`\n${data.messages} сообщений${data.images?' · '+data.images+' с изображениями':''}`
+    +'\n'+(cache.known?`Кеш последнего запроса: ${fmt(cache.hit_tokens)} из ${fmt(cache.prompt_tokens)} токенов (${cache.percent}%)`
+                     :'Кеш последнего запроса: данных от API нет')
     +'\nПри переполнении самые старые ходы исключаются из контекста; история чата сохраняется.';
 }
 async function loadContext(){
   if(!current){renderContext(null);return;}
   try{renderContext(await api(`/api/sessions/${current.id}/context`));}catch{}
+}
+// The goal is rendered by the goal banner (renderGoal, below); loadGoal restores it after a reload.
+async function loadGoal(){
+  if(!current){renderGoal(null);return;}
+  try{renderGoal(await api(`/api/sessions/${current.id}/goal`));}catch{}
 }
 function toast(message) { $('toast').textContent = message; $('toast').hidden = false; clearTimeout(toast.timer); toast.timer = setTimeout(() => $('toast').hidden = true, 6000); }
 let authRecovery=null;
@@ -115,7 +124,9 @@ function renderAttachments(){
       const img=el('img');img.alt=item.name;img.decoding='async';
       // Local object URL: the preview appears immediately and never depends on a server round trip.
       img.src=item.preview;
-      img.onerror=()=>{img.src=`/api/sessions/${item.sid}/image?path=${encodeURIComponent(item.path)}`;};
+      img.onerror=()=>{img.src=window.MediaUI?window.MediaUI.url(item.sid,item.path,'thumb'):`/api/sessions/${item.sid}/image?path=${encodeURIComponent(item.path)}`;};
+      img.title='Открыть во весь экран';
+      img.onclick=()=>window.MediaUI?.open(item.sid,item.path);
       chip.append(img);
     }
     const meta=el('div',undefined,'attachment-meta');
@@ -304,6 +315,7 @@ async function refresh() {
   autoToggle.classList.toggle('on',!!selected?.auto_approve);
   await loadQueue();
   await loadContext();
+  await loadGoal();
   await loadQuestions();
   renderApprovals(approvals.filter(a => a.sid === current?.id));
 }
@@ -328,6 +340,7 @@ async function selectSession(session) {
   try{$('message').value=localStorage.getItem('aigent.draft.'+session.id)||'';localStorage.setItem('aigent.selectedSession',session.id);}catch{}
   if (window.innerWidth<=700) document.body.classList.remove('sidebar-collapsed');
   $('events').replaceChildren(); $('empty').hidden = true; setText('session-title', session.title); setText('read-saved', '0 символов');
+  renderGoal(null);
   let cursor = 0;
   while (true) {
     const events = await api(`/api/sessions/${session.id}/events?after=${cursor}`);
@@ -437,6 +450,8 @@ function renderFarmChip(turn,info){
 function renderEvent(event) {
   if (seen.has(event.id)) return; seen.add(event.id);
   const p = event.payload, kind = event.kind;
+  // Re-broadcast every rendered event so separate modules (the 3D dock) can react without patching here.
+  try{window.dispatchEvent(new CustomEvent('aigent:event',{detail:{event,sid:current?.id||''}}));}catch{}
   if (kind === 'read_cache') {readSaved += p.avoided_chars; setText('read-saved', fmt(readSaved) + ' символов');}
   const TOOL_ICONS={read_file:'📖',list_files:'📂',search_files:'🔎',write_file:'✏️',apply_patch:'✏️',
     exec_command:'⌨️',run_command:'⌨️',shared_image:'🎨',shared_video:'🎞️',shared_skill:'📎',view_image:'🖼️',
@@ -462,6 +477,7 @@ function renderEvent(event) {
   // Ask the server which questions are still open: a replayed event must not reopen a closed one.
   if (kind === 'background_question') loadQuestions();
   if (kind === 'background_answered') closeBackgroundQuestion(p.id);
+  if (kind === 'goal') return;
   if (['approval', 'approval_closed', 'decision', 'read_cache'].includes(kind)) return;
   const nearBottom = $('chat-panel').scrollHeight - $('chat-panel').scrollTop - $('chat-panel').clientHeight < 160;
   if(kind==='user'){finishTurn();turnView=null;const node=el('article',undefined,'event user');node.append(el('pre',p.text||''));$('events').append(node);}
@@ -484,6 +500,10 @@ function renderEvent(event) {
   else if(['context','provider_session','telegram_payload'].includes(kind)){
     const detail=el('details',undefined,'turn-detail');const summary=el('summary',p.text||'Данные подключения');detail.append(summary);
     const body=el('div');detail.append(body);lazyStructured(detail,body,p);t.actions.append(detail);t.work.hidden=false;
+  } else if(kind==='media'&&p.path&&(window.MediaUI?.isViewable?.(p.path)??window.MediaUI?.isMedia(p.path))){
+    // Interactive card: server thumbnail, lightbox and inline playback; several in a row share a grid.
+    window.MediaUI.grid(t.answer).append(window.MediaUI.render(current.id,p.path,
+      {kind:p.kind,direction:p.direction,caption:p.prompt||p.caption||''}));
   } else {
     node = el('article', undefined, 'event ' + kind);
     const names = {user:'ВЫ', assistant:(p.provider||current?.provider||'deepseek').toUpperCase(), tool:'ДЕЙСТВИЕ', tool_result:'РЕЗУЛЬТАТ', media:'🖼 ВЛОЖЕНИЕ', error:'⛔ ОШИБКА', context:'📋 КОНТЕКСТ', notice:'•', usage:'USAGE'};
@@ -619,8 +639,11 @@ function renderGoal(goal){
   banner.replaceChildren(el('span',GOAL_ICONS[goal.kind]||'🎯','goal-mark'),
                          el('span',shorten(goal.goal,46),'goal-text'));
   if(STATUS_ICONS[goal.status])banner.append(el('span',STATUS_ICONS[goal.status],'goal-status'));
+  const steps=goal.steps||[],done=steps.filter(s=>s.status==='completed').length;
+  if(steps.length)banner.append(el('span',`${done}/${steps.length}`,'goal-count'));
   banner.title=`Цель (${goal.kind||'—'}, ${goal.status||'active'}): ${goal.goal}`
-    +'\nПока цель активна, ход продолжается автоматически.';
+    +(steps.length?`\nПлан: ${steps.map(s=>(s.status==='completed'?'✓ ':s.status==='in_progress'?'◌ ':'· ')+(s.text||'')).join('\n')}`:'')
+    +(goal.auto_continue?'\nПока цель активна, ход продолжается автоматически.':'');
 }
 // The server owns a background question: it is asked once, retired when it gets stale, and a
 // closed one never comes back — reloading the page cannot resurrect it from the event log.
@@ -723,7 +746,10 @@ function renderApprovals(items) {
 async function loadFiles() {
   if (!current) return;
   const files = await api(`/api/sessions/${current.id}/files`);
-  $('files-list').replaceChildren(...files.map(f => {const row = el('div', undefined, 'file-row'); const link = el('a', f.path); link.href = `/api/sessions/${current.id}/file?path=${encodeURIComponent(f.path)}`; row.append(link, el('small', fmt(f.size) + ' B')); return row;}));
+  $('files-list').replaceChildren(...files.map(f => {const row = el('div', undefined, 'file-row'); const link = el('a', f.path); link.href = `/api/sessions/${current.id}/file?path=${encodeURIComponent(f.path)}`;
+    // Images, video and audio open in the viewer instead of downloading.
+    if(window.MediaUI?.isViewable?.(f.path)??window.MediaUI?.isMedia(f.path)){link.title='Открыть просмотр';link.onclick=e=>{e.preventDefault();window.MediaUI.open(current.id,f.path);};}
+    row.append(link, el('small', fmt(f.size) + ' B')); return row;}));
   if (!files.length) $('files-list').append(el('p', 'В этой сессии пока нет файлов.', 'muted'));
 }
 function svgNode(tag, attrs, text) {const n = document.createElementNS('http://www.w3.org/2000/svg', tag); for (const [k,v] of Object.entries(attrs)) n.setAttribute(k, v); if (text != null) n.textContent = text; return n;}

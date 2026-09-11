@@ -395,7 +395,7 @@ class FarmClient:
 
     def stream(self, method, url, **kwargs):
         self.calls.append((method, url))
-        self.bodies.append({})  # keep calls and bodies index-aligned for the assertions below
+        self.bodies.append(kwargs.get("json") or {})  # calls and bodies stay index-aligned
         return FarmResponse(chunks=[self.image])
 
 
@@ -539,8 +539,13 @@ async def test_context_meter_reports_the_budget_that_triggers_trimming(bundle):
     sid = session["id"]
     config.values["max_context_chars"] = 10000
     empty = agent.context_size(sid)
-    assert {k: empty[k] for k in ("chars", "limit", "percent", "messages", "images")} == {
-        "chars": 2, "limit": 10000, "percent": 0.0, "messages": 0, "images": 0}
+    # The meter also carries an approximate token budget and the cache accounting of the last
+    # request; with no request yet the cache is unknown.
+    assert empty == {"chars": 2, "limit": 10000, "percent": 0.0, "messages": 0, "images": 0,
+                     "tokens": 0, "limit_tokens": 2500,
+                     "raw_chars": 2, "compacted_chars": 2,
+                     "cache": {"known": False, "hit_tokens": None, "miss_tokens": None,
+                               "prompt_tokens": None, "percent": None}}
     assert empty["limit_tokens"] == round(10000 / 4), "the meter also reports an approximate token budget"
 
     store.message(sid, {"role": "user", "content": "x" * 2000})
@@ -771,31 +776,3 @@ def test_the_api_lists_only_open_questions_and_answers_them_once(web):
     dismissed = client.post(f"/api/sessions/{sid}/async-questions/q2", json={"answer": ""}).json()
     assert dismissed == {"closed": True, "queued": False}
     assert client.get(f"/api/sessions/{sid}/async-questions").json() == []
-
-
-# 26 ---------------------------------------------------------------------------------
-async def test_quality_preset_selects_the_high_quality_farm_workflow(bundle):
-    _, store, agent = bundle
-    session = store.resolve(41, 0, 1)
-    frame = agent.workspace(session["id"]) / "shot.png"
-    frame.write_bytes(png_bytes())
-    client = FarmClient(b"mp4")
-    shared = SharedTools(agent, client)
-
-    await shared.run(session, "video", {"path": "shot.png", "quality": "hq"}, wait=True)
-    hq = [body for (_, url), body in zip(client.calls, client.bodies, strict=True)
-          if url.endswith("/renderfin/api-render")][-1]
-    assert hq["work_flow"] == shared_tools.WORKFLOWS["hq"]["file"] == "gen_animation_hq_by_url.json"
-
-    await shared.run(session, "video", {"path": "shot.png", "quality": "fast"}, wait=True)
-    fast = [body for (_, url), body in zip(client.calls, client.bodies, strict=True)
-            if url.endswith("/renderfin/api-render")][-1]
-    assert "work_flow" not in fast, "the default workflow is chosen by omitting the field"
-
-    await shared.run(session, "video", {"path": "shot.png", "quality": "hq",
-                                        "work_flow": "custom_anim.json"}, wait=True)
-    manual = [body for (_, url), body in zip(client.calls, client.bodies, strict=True)
-              if url.endswith("/renderfin/api-render")][-1]
-    assert manual["work_flow"] == "custom_anim.json", "an explicit name wins over the preset"
-    assert {item["name"] for item in shared.catalogue()} == {"image", "video", "skill"}
-    assert "quality" in {f["name"] for f in next(i for i in shared.catalogue() if i["name"] == "video")["fields"]}

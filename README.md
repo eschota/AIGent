@@ -24,6 +24,12 @@ DeepSeek API, local Codex App Server and independently authenticated Claude CLI 
 - **Actual coding tools:** list/read/search files, approve exact changes, retrieve artifacts. Command execution is disabled by default and requires a separate administrator approval when enabled.
 - **Every request accounted for:** input/output, cache read/miss, estimated USD cost and cache savings, per-session request charts and the API account balance.
 - **Media bridge:** photos, documents, audio, voice, video, video notes, animations and stickers in both directions. Other Telegram message structures are preserved in the event journal. Flash can inspect images; text files can enter context.
+- **Interactive previews:** pictures and clips in the chat, in attachments and in the file list open in a viewer — server-side thumbnails, a lightbox with ← / → and 1:1 zoom, and video that plays inline. Video is transcoded on the fly to H.264/AAC MP4 (already-compatible MP4 is passed through untouched) and every derived file is cached under `.local/media-cache/`. `ffmpeg` is optional: install it for video covers and transcoding (`winget install Gyan.FFmpeg`, or set `ffmpeg_path` in settings); without it pictures still work and clips are served as-is for native browser playback.
+- **Built-in 3D viewer for generated models:** a dock that stays loaded for the whole session. Every `.glb`/`.gltf` in the workspace is listed with its triangle count and thumbnail, and a newly generated model opens by itself («Автопоказ»). It is a native three.js renderer whose look follows the Gravity House server graphics record (`/api/graphics/preset`): sun direction, colour and shadow strength, sky/ambient colours, ACES tone mapping, SSAO, bloom and vignette all read their values from that record, and quality **1 / 2 / 3** are the levels the server derives — 1 without shadows or post, 2 with PCF 2048 shadows, tone mapping and vignette, 3 with PCFSoft 4096 shadows, SSAO, bloom (only when the record enables it) and SMAA/FXAA. A quality change touches renderer, light and pass settings only: meshes and transforms stay as loaded. Offline, or with `allow_web: false`, the embedded revision-24 record is used and the answer says `source: "builtin"`. Keys inside the panel: `1` `2` `3` quality, `P` post on/off, `R` reset camera, `F` frame the model, `G` grid and floor, `W` wireframe, `Alt+1…Alt+9` material channel — the composer and the code editor keep their own keyboard. Channels: Lit, Albedo/BaseColor, Roughness, Metallic, Normals, Emissive, AO, UV checker, Wireframe, Vertex colors, Alpha; a channel whose map is missing shows the material's scalar value and says so. DRACO-compressed and KTX2/Basis-textured models load through decoders served from `/static/vendor/three/`, so nothing is fetched from a CDN. Where WebGL is unavailable the panel says so instead of failing silently. Every model carries a `<model>.json` passport next to it — format, prompt, seed, parameters, source job, SHA-256, parsed statistics, reference images and an edit history — editable from the panel; see [docs/API.md](docs/API.md). `.fbx`, `.obj` and `.usdz` are listed but not viewable.
+- **Looping video:** clips in the chat and in the lightbox loop by default, with a ⟲ switch that applies to every player and is remembered.
+- **Remote hosts over SSH:** hosts configured in settings (`ssh_hosts`) give the agent `ssh_exec`, `ssh_upload` and `ssh_download` through the system OpenSSH client. Key-based authentication only — no password is ever requested or stored, `BatchMode` forbids interactive prompts — and every command or transfer needs a separate administrator approval. Without configured hosts the tools do not exist for the model.
+- **Browser and web access:** `web_fetch` reads any public page as text, `web_search` returns titles, links and snippets, and `browser_open` renders a page in headless Microsoft Edge or Google Chrome and saves the screenshot into the chat, where it opens in the same viewer as any other picture — a vision model also sees it. Screenshots need Edge or Chrome installed (or `browser_binary` in settings); without one the tool is not offered. Search is a lightweight scrape of DuckDuckGo's HTML page, not an official API, so it can break — `web_search_url` can point at your own SearXNG. There is no clicking or scrolling inside the page. Only public `http`/`https` addresses are reachable: loopback, private and link-local hosts are refused on every redirect, so the agent cannot reach the connector's own admin API. Set `allow_web: false` to remove all three tools.
+- **Project map — free by default, paid only on request:** the «Карта проекта» widget inventories the selected workspace locally: every file with size, lines, language and sha256, the git branch, HEAD, last twenty commits, dirty count and credential-free remotes, Python/JS import edges resolved inside the project, and the indexed skills and memory notes that belong to it. That costs **zero tokens**. It then shows what a DeepSeek scan *would* cost: estimated input/output tokens, number of requests, price at full cache miss and at an 80 % cache hit, plus one extra request for the map summary. Three buttons spend money and say so: «Проверить на 3 файлах» sends one small real request and stores the calibration factor (`actual / estimated`, shown as «калибровка ×1.07»), «Сканировать» runs the batch job under a dollar limit (`project_map_budget_usd`, default `$0.50`) and can be paused, resumed and cancelled at any time — pause finishes the request already in flight, and resume continues from the next batch, never repeating paid work. The job auto-pauses and explains itself when the next request would cross the limit. Live progress, tokens and spend stream into the widget; the finished map draws a module dependency graph, per-file purposes, related skills and a ≤200-word overview, and gives the agent a ≤3000-character project memory that is added to the project rules of every turn. Nothing is written into your project directory.
 - **Connector APIs:** OpenAPI-documented session/event/file endpoints and OpenAI-compatible `/v1/chat/completions` and `/v1/models` with streaming and tool-call pass-through.
 
 **Status: desktop preview.** DeepSeek and local Codex tool turns have been exercised against real providers. The installed Claude CLI bridge has passed its protocol handshake; full Claude turns require an authenticated CLI profile and remain to be validated. Browser login alone does not authorize a CLI profile. See [TODO.md](TODO.md).
@@ -68,6 +74,7 @@ Open the bot and send `/start` or any message. Enter the chat password in a **pr
 | `/resume ID` | Resume a session in the same topic |
 | `/usage` | Current session token and cache totals |
 | `/balance` | Shared DeepSeek API account balance |
+| `/status` | Provider, model, project, queue, context fill and media stored in Telegram |
 | `/stop` | Cancel the active turn; completed file changes remain |
 | `/logout` | Revoke your login and cancel your active turns |
 
@@ -76,6 +83,47 @@ Open the bot and send `/start` or any message. Enter the chat password in a **pr
 Enable **Topic Mode** for the bot in **BotFather** to get visible topics in private chats. In forum supergroups the bot needs `can_manage_topics`. Without this capability `/new` still creates separate resumable sessions in the current chat.
 
 Bots cannot create a Telegram group for a user through Bot API. The web UI provides an **Add to group** deep link. Users select/create their group in Telegram and add the bot. Group privacy mode controls whether Telegram delivers ordinary non-command messages; disable it in BotFather or make the bot an administrator if all group messages should reach it. Group replies are visible to group members even though model histories are isolated per user.
+
+### Telegram session mirror
+
+One supergroup can duplicate **every** IDE session, so the same conversation continues from a phone and
+from the desktop.
+
+1. Create a supergroup, switch **Topics** on and add the bot as an administrator with `can_manage_topics`
+   (in BotFather, `/setprivacy` → Disabled if ordinary messages should reach the bot).
+2. Copy the chat id (it starts with `-100`) into settings key `telegram_sync_chat_id`. `telegram_sync`
+   (default on when the chat id is set) turns mirroring off without losing the binding.
+3. Existing sessions receive their topic from `POST /api/sync/backfill`, which also runs at startup. It is
+   rate limited to one request per second, idempotent and resumable.
+
+What happens in a mirrored session:
+
+| IDE | Telegram topic |
+| --- | --- |
+| Session created / renamed / deleted | `createForumTopic` + header message / `editForumTopic` / `closeForumTopic` (topics are never deleted) |
+| Message sent from the IDE | `👤 text` in the topic |
+| Assistant answer, error | posted once, plain text, split at 4096 characters with `… (n/m)` markers |
+| Tool calls of one turn | one compact `🛠 Инструменты за ход:` summary per turn, not one message per call |
+| Approvals, questions, streamed preview | unchanged: existing buttons and the rolling preview message |
+| Media produced or received | uploaded to the topic, `file_id` recorded |
+| Message written in the topic | queued or started as a turn in the same session; `/stop`, `/status`, `/new` work there |
+
+Session notices (context compaction, queue changes) stay in the IDE journal. A mirror failure is reported
+once per session as a `notice`; the agent keeps working.
+
+### Media stored in Telegram
+
+Every media event with a workspace path is uploaded to the session topic (`sendPhoto`/`sendVideo`/
+`sendDocument` by media type) and indexed in the `media_files` table with its `file_id`, sha256, size and
+message id. `GET /api/sessions/{id}/media/telegram?path=` serves the local copy, or re-downloads it from
+Telegram when the cache is empty. `POST /api/sessions/{id}/media/evict` frees the local copy — only when a
+`file_id` exists. With `telegram_media_offload` on, files larger than `telegram_media_offload_mb`
+(default 20) are evicted automatically right after a verified upload.
+
+> The Bot API cannot list the history of a topic. The local sqlite index of `file_id` values is the only
+> way back to those files: **back up `.local/sessions.sqlite3` together with the workspaces.** Files above
+> the 50 MB upload limit stay local and are reported as a notice; downloads are limited to 20 MB.
+> Private paths (`.local`, credentials, anything outside the workspace) are never uploaded.
 
 ### Cache and economy
 
@@ -87,7 +135,15 @@ DeepSeek's prefix cache is automatic and best effort. AIGent keeps a stable syst
 
 Rates are a dated **2026-09-11 snapshot**, include the documented weekday peak/off-peak UTC schedule, and are stored per request. They are estimates, not provider invoices. Unknown model tariffs are not guessed. Cached tokens still count toward context length. Repeated unchanged file reads return a reference to earlier context; avoided **characters** are shown separately and are not presented as measured token savings. Thinking tokens are part of billed output.
 
+The prefix is kept stable deliberately, because a hit costs about a tenth of a miss. The system prompt carries nothing volatile — no clock, a deterministic tool order, and project guidance keyed by its sha256 — so it stays byte-identical across the steps of a turn and across turns of a session. The date, the current goal and plan and the state of a background job travel in a short **turn note** appended as the last message, where a change costs nothing. Compaction is prefix-preserving: a watermark persisted per session (`compact_target_ratio`, default 0.7) compacts only older messages, in large steps well below the limit so it does not repeat every step, and never rewrites anything newer — the same compacted prefix is sent again next turn. The composer meter and the `context` event show the cache hit rate of the last request.
+
 The settings expose output, context and step limits. Once the text context limit is reached, oldest complete user turns leave the model context; the full local transcript stays stored and the UI records the change. Prefer a new session for an unrelated task. Smaller outputs and turning Thinking off reduce spend when reasoning is unnecessary.
+
+### Goal of a session
+
+A long job — render frames on the farm, animate them, deliver the clips — needs an objective that outlives compaction. Every session keeps a goal: `{goal, kind, status, steps, note, updated, source, auto_continue}`. The first user message becomes the initial goal deterministically, without an extra model call; the model refines it with `set_goal` and keeps the steps current with `update_plan`, which is mirrored into the same state. The goal is shown as a banner above the composer, readable and editable at `GET`/`POST /api/sessions/{sid}/goal`, and repeated to the model in every turn note.
+
+With `auto_continue` on for a session (default on, per chat), a turn that ends with the goal still active queues its own follow-up toward that goal, at most `max_auto_continues` times (default 8) per user message, and never after an error, a cancellation or a pending approval or blocking question. Each continuation is announced as an event. A tool that waited for a background render is work, not a loop, so the loop guard does not end the turn because of it.
 
 ### Limits to know
 

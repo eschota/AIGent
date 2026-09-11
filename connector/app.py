@@ -15,10 +15,11 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field
 
-from .agent import Agent, safe_path
+from .agent import GOAL_STATUSES, Agent, safe_path
 from .config import Config, password_hash, verify_password
 from .providers import DeepSeek, ProviderError, TelegramAPI, account_usage
 from .store import Store
+from .sync import SessionSync
 from .telegram import Bot
 from .local_providers import LocalProviders
 from .updates import UpdateChannel
@@ -27,7 +28,12 @@ from .workspace import WorkspaceService
 from .autorig import AutoRigTools
 from .computer import ComputerTools
 from .skill_manager import SkillIndex
+from .project_map import ProjectMap
 from .shared_tools import SharedTools
+from .ssh_tools import SSHTools
+from .browser_tools import BrowserTools
+from .media import MediaService, MediaUnavailable, UnsupportedMedia
+from .models import ModelError, ModelRegistry, asset_mime
 
 
 class PasswordBody(BaseModel):
@@ -47,6 +53,25 @@ class Settings(BaseModel):
     max_steps: int = Field(default=12, ge=1, le=40)
     update_repo: str = Field(default="eschota/AIGent", max_length=200)
     auto_update_check: bool = True
+    # Omitted SSH keys keep their stored value: a settings form without them must not drop hosts.
+    ssh_hosts: list[dict] | None = Field(default=None, max_length=50)
+    ssh_binary: str | None = Field(default=None, max_length=400)
+    ssh_timeout_seconds: int | None = Field(default=None, ge=5, le=3600)
+    # Telegram session mirror; omitted keys keep their stored value.
+    telegram_sync_chat_id: str | None = Field(default=None, max_length=40)
+    telegram_sync: bool | None = None
+    telegram_media_offload: bool | None = None
+    telegram_media_offload_mb: int | None = Field(default=None, ge=1, le=2000)
+    # Omitted media keys keep their stored value as well.
+    ffmpeg_path: str | None = Field(default=None, max_length=400)
+    media_transcode_timeout_seconds: int | None = Field(default=None, ge=10, le=3600)
+    media_cache_mb: int | None = Field(default=None, ge=16, le=100000)
+    # Omitted web/browser keys keep their stored value too.
+    allow_web: bool | None = None
+    web_search_url: str | None = Field(default=None, max_length=500)
+    web_allow_private: bool | None = None
+    browser_binary: str | None = Field(default=None, max_length=400)
+    browser_timeout_seconds: int | None = Field(default=None, ge=5, le=600)
 
 
 class ChatBody(BaseModel):
@@ -87,8 +112,17 @@ class SessionUpdate(BaseModel):
     project_id: str | None = None
 
 
+class MediaPathBody(BaseModel):
+    path: str = Field(min_length=1, max_length=500)
+
+
 class SkillAttachBody(BaseModel):
     session_id: str
+
+
+class MapScanBody(BaseModel):
+    mode: str = "summaries"
+    max_cost_usd: float | None = Field(default=None, ge=0, le=100)
 
 
 class FileLocation(BaseModel):
@@ -136,6 +170,21 @@ class DecisionBody(BaseModel):
     accepted: bool
 
 
+class GoalStep(BaseModel):
+    text: str = Field(default="", max_length=300)
+    step: str = Field(default="", max_length=300)
+    status: str = "pending"
+
+
+class GoalBody(BaseModel):
+    """The user editing the objective from the IDE; it reaches the model in the next turn note."""
+    goal: str | None = Field(default=None, max_length=2000)
+    status: str | None = None
+    note: str | None = Field(default=None, max_length=500)
+    steps: list[GoalStep] | None = Field(default=None, max_length=40)
+    auto_continue: bool | None = None
+
+
 class ComputerBody(BaseModel):
     window_id: int | None = None
 
@@ -152,6 +201,17 @@ class CompletionBody(BaseModel):
     stream: bool = False
 
 
+class ModelSidecarBody(BaseModel):
+    path: str = Field(min_length=1, max_length=500)
+    patch: dict = Field(default_factory=dict)
+
+
+class ModelReferenceBody(BaseModel):
+    path: str = Field(min_length=1, max_length=500)
+    image: str = Field(min_length=1, max_length=500)
+    note: str = Field(default="", max_length=500)
+
+
 def create_app(root: Path | None = None, polling=True):
     config = Config(root or Path(__file__).resolve().parents[1] / ".local")
     store = Store(config.root / "sessions.sqlite3", recover=True)
@@ -162,14 +222,26 @@ def create_app(root: Path | None = None, polling=True):
     agent.local = local
     workspace_service = WorkspaceService(agent)
     agent.workspace_service = workspace_service
+    media = MediaService(config, agent.workspace)
+    agent.media = media
+    models3d = ModelRegistry(config, agent.workspace, client)
+    agent.models3d = models3d
     autorig = AutoRigTools(agent, client)
     agent.extensions.append(autorig)
     computer = ComputerTools(agent)
     agent.extensions.append(computer)
+    ssh = SSHTools(agent)
+    agent.extensions.append(ssh)
+    browser = BrowserTools(agent, client)
+    agent.extensions.append(browser)
     skills = SkillIndex(config, store, agent.workspace)
+    project_map = ProjectMap(config, store, agent, skills)
+    agent.project_map = project_map
     shared = SharedTools(agent, client, skills)
     agent.extensions.append(shared)
     bot = Bot(config, store, telegram, agent)
+    sync = SessionSync(config, store, telegram, agent)
+    agent.sync = sync
     updates = UpdateChannel(client, config["update_repo"])
     failures = {}
 
@@ -179,11 +251,25 @@ def create_app(root: Path | None = None, polling=True):
             bot.task = asyncio.create_task(bot.poll())
         skills.start()
         shared.resume()
+        sync.start()
+        if sync.enabled:
+            # Give sessions created while the mirror was off a topic, then mirror the missed events.
+            async def resume_sync():
+                await sync.backfill()
+                for item in store.sessions():
+                    await sync.catch_up(item["id"])
+            app.state.sync_task = asyncio.create_task(resume_sync())
         for session in store.sessions():
             if store.queued(session["id"]):
                 agent.drain(session["id"])
         yield
+        task = getattr(app.state, "sync_task", None)
+        if task:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await sync.close()
         await shared.close()
+        await project_map.close()
         await skills.stop()
         if bot.task:
             bot.task.cancel()
@@ -196,6 +282,9 @@ def create_app(root: Path | None = None, polling=True):
                   description="Local agent connector. Authenticate with the admin cookie or connector Bearer token.")
     app.state.config, app.state.store, app.state.agent, app.state.bot = config, store, agent, bot
     app.state.client, app.state.skills, app.state.shared = client, skills, shared
+    app.state.project_map = project_map
+    app.state.sync = sync
+    app.state.models3d = models3d
     app.state.started = time.time()
     app.state.updates = updates
 
@@ -209,9 +298,14 @@ def create_app(root: Path | None = None, polling=True):
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "no-referrer"
-        response.headers["Cache-Control"] = "no-store"
+        # Immutable media variants carry their own caching header; everything else stays uncached.
+        if "cache-control" not in response.headers:
+            response.headers["Cache-Control"] = "no-store"
         if request.url.path == "/":
-            response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'none'"
+            # The 3D viewer needs two narrow additions: worker-src for the DRACO and KTX2 decoder workers,
+            # which three.js builds from a same-origin blob, and 'wasm-unsafe-eval' for their WebAssembly
+            # decoders. Neither permits inline script, eval or a remote origin; scripts stay at 'self'.
+            response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; frame-ancestors 'none'"
         return response
 
     def bearer(request):
@@ -282,6 +376,13 @@ def create_app(root: Path | None = None, polling=True):
         for key in ("deepseek_key", "telegram_token"):
             if not values[key].strip():
                 values.pop(key)
+        for key in ("telegram_sync_chat_id", "telegram_sync", "telegram_media_offload",
+                    "telegram_media_offload_mb", "ssh_hosts", "ssh_binary", "ssh_timeout_seconds",
+                    "ffmpeg_path", "media_transcode_timeout_seconds", "media_cache_mb",
+                    "allow_web", "web_search_url", "web_allow_private", "browser_binary",
+                    "browser_timeout_seconds"):
+            if values.get(key) is None:
+                values.pop(key, None)
         if "chat_password" in values:
             config.values["auth_epoch"] += 1
         config.values.update(values)
@@ -370,13 +471,16 @@ def create_app(root: Path | None = None, polling=True):
 
     @app.get("/api/sessions", dependencies=[Depends(require_admin)])
     async def list_sessions(archived: bool = False, deleted: bool = False):
-        return [s | {"usage": store.usage(s["id"])} for s in store.sessions(archived, deleted)]
+        return [s | {"usage": store.usage(s["id"]), "telegram": sync.info(s)}
+                for s in store.sessions(archived, deleted)]
 
     @app.delete("/api/sessions/{sid}", dependencies=[Depends(require_admin)])
     async def delete_session(sid: str):
         require_session(sid)
         agent.stop(sid)
         store.execute("UPDATE sessions SET deleted=1,active=0 WHERE id=?", (sid,))
+        # The forum topic is closed, never deleted: a restored session keeps its history and media.
+        await sync.closed(store.session(sid))
         return {"deleted": True, "recoverable": True, "files_preserved": True}
 
     @app.post("/api/sessions/{sid}/restore", dependencies=[Depends(require_admin)])
@@ -397,8 +501,9 @@ def create_app(root: Path | None = None, polling=True):
             if not projects:
                 raise HTTPException(404, "Project not found")
             workspace = projects[0]["path"]
-        return store.update_session(session["id"], provider=account["provider"], account_id=account["id"],
+        session = store.update_session(session["id"], provider=account["provider"], account_id=account["id"],
             model=body.model, effort=body.effort, workspace=workspace, project_id=body.project_id)
+        return await sync.ensure_topic(session)
 
     @app.patch("/api/sessions/{sid}", dependencies=[Depends(require_admin)])
     async def update_session(sid: str, body: SessionUpdate):
@@ -427,6 +532,11 @@ def create_app(root: Path | None = None, polling=True):
         if "auto_approve" in fields:
             store.event(sid, "notice", {"text": "Автоприменение команд и правок: "
                                                 + ("включено" if updated["auto_approve"] else "выключено")})
+        if "title" in fields:
+            try:
+                await sync.rename(updated, updated["title"])
+            except ProviderError as exc:
+                store.event(sid, "notice", {"text": "Не удалось переименовать топик Telegram: " + config.redact(exc)})
         return updated
 
     @app.post("/api/sessions/{sid}/fork", dependencies=[Depends(require_admin)])
@@ -511,6 +621,123 @@ def create_app(root: Path | None = None, polling=True):
     async def image_preview(sid: str, path: str):
         return media_file(sid, path)
 
+    @app.get("/api/media/capabilities", dependencies=[Depends(require_admin)])
+    async def media_capabilities():
+        return media.capabilities()
+
+    @app.get("/api/sessions/{sid}/media", dependencies=[Depends(require_admin)])
+    async def media_variant(sid: str, path: str, variant: str = "original"):
+        """Serve the original file, a thumbnail, a browser-ready preview or a poster frame.
+
+        Cache keys include the source mtime and size, so a served variant is immutable.
+        A preview still transcoding answers 202 and the client polls the same URL.
+        """
+        require_session(sid)
+        try:
+            result = await media.render(sid, path, variant)
+        except FileNotFoundError as exc:
+            raise HTTPException(404, str(exc)) from None
+        except UnsupportedMedia as exc:
+            raise HTTPException(415, str(exc)) from None
+        except MediaUnavailable as exc:
+            raise HTTPException(503, config.redact(exc)) from None
+        if result["status"] == "processing":
+            return Response(json.dumps({"status": "processing", "variant": result["variant"]}),
+                            202, media_type="application/json")
+        return FileResponse(result["path"], media_type=result["media_type"],
+                            headers={"Cache-Control": "private, max-age=31536000, immutable"})
+
+    @app.head("/api/sessions/{sid}/media", include_in_schema=False, dependencies=[Depends(require_admin)])
+    async def media_variant_head(sid: str, path: str, variant: str = "thumb"):
+        """The interface polls a running transcode with HEAD, so waiting costs no download."""
+        return await media_variant(sid, path, variant)
+
+    @app.get("/api/sessions/{sid}/media/telegram", dependencies=[Depends(require_admin)])
+    async def media_from_telegram(sid: str, path: str):
+        """Serve a media file, re-downloading it from Telegram when the local cache is empty."""
+        require_session(sid)
+        file = await sync.restore(sid, path)
+        return FileResponse(file, filename=file.name, media_type=asset_mime(file))
+
+    @app.post("/api/sessions/{sid}/media/evict", dependencies=[Depends(require_admin)])
+    async def media_evict(sid: str, body: MediaPathBody):
+        """Delete the local copy of a file that is verifiably stored in Telegram."""
+        require_session(sid)
+        return sync.evict(sid, body.path)
+
+    @app.get("/api/sessions/{sid}/sync", dependencies=[Depends(require_admin)])
+    async def session_sync(sid: str):
+        return sync.info(require_session(sid))
+
+    @app.post("/api/sync/backfill", dependencies=[Depends(require_admin)])
+    async def sync_backfill():
+        """Give every session without a topic one. Idempotent, rate limited, resumable."""
+        result = await sync.backfill()
+        await sync.drain()
+        return result
+
+    @app.get("/api/sessions/{sid}/media/info", dependencies=[Depends(require_admin)])
+    async def media_info(sid: str, path: str):
+        require_session(sid)
+        try:
+            return await media.info(sid, path)
+        except UnsupportedMedia as exc:
+            raise HTTPException(415, str(exc)) from None
+        except MediaUnavailable as exc:
+            raise HTTPException(503, config.redact(exc)) from None
+
+    # ---------------------------------------------------------------- 3D models and the viewer preset
+    @app.get("/api/graphics/preset", dependencies=[Depends(require_admin)])
+    async def graphics_preset(refresh: bool = False):
+        """Gravity House server graphics record plus the derived quality levels 1/2/3.
+
+        Offline, or with web access switched off, the embedded revision-24 record is used and the
+        answer says so in "source".
+        """
+        return await models3d.preset(refresh)
+
+    @app.get("/api/sessions/{sid}/models", dependencies=[Depends(require_admin)])
+    async def list_models(sid: str):
+        """Every model file in the workspace. A missing sidecar is created on first listing."""
+        require_session(sid)
+        return await asyncio.to_thread(models3d.list, sid)
+
+    @app.get("/api/sessions/{sid}/models/sidecar", dependencies=[Depends(require_admin)])
+    async def model_sidecar(sid: str, path: str):
+        require_session(sid)
+        try:
+            return await asyncio.to_thread(models3d.sidecar, sid, path)
+        except ModelError as exc:
+            raise HTTPException(404, str(exc)) from None
+
+    @app.post("/api/sessions/{sid}/models/sidecar", dependencies=[Depends(require_admin)])
+    async def model_sidecar_update(sid: str, body: ModelSidecarBody):
+        require_session(sid)
+        try:
+            return await asyncio.to_thread(models3d.update_sidecar, sid, body.path, body.patch)
+        except ModelError as exc:
+            raise HTTPException(400, str(exc)) from None
+
+    @app.post("/api/sessions/{sid}/models/reference", dependencies=[Depends(require_admin)])
+    async def model_reference(sid: str, body: ModelReferenceBody):
+        require_session(sid)
+        try:
+            return await asyncio.to_thread(models3d.add_reference, sid, body.path, body.image, body.note)
+        except ModelError as exc:
+            raise HTTPException(400, str(exc)) from None
+
+    @app.get("/api/sessions/{sid}/asset/{path:path}", dependencies=[Depends(require_admin)])
+    async def workspace_asset(sid: str, path: str):
+        """Serve a workspace file inline with its real media type.
+
+        A .gltf model references its .bin buffers and textures by relative URL, so the loader needs
+        every sibling file at a predictable address; safe_path keeps that inside the workspace.
+        """
+        require_session(sid)
+        file = safe_path(agent.workspace(sid), path)
+        if not file.is_file():
+            raise HTTPException(404, "File not found")
+        return FileResponse(file, media_type=asset_mime(file))
     @app.post("/api/sessions/{sid}/file-path", dependencies=[Depends(require_admin)])
     async def file_location(sid: str, body: FileLocation):
         """The desktop shell needs a real path to put a file on the OS clipboard."""
@@ -520,9 +747,6 @@ def create_app(root: Path | None = None, polling=True):
             raise HTTPException(404, "File not found")
         return {"absolute": str(file), "name": file.name, "bytes": file.stat().st_size}
 
-    @app.get("/api/sessions/{sid}/media", dependencies=[Depends(require_admin)])
-    async def media_preview(sid: str, path: str):
-        return media_file(sid, path)
 
     @app.post("/api/projects", dependencies=[Depends(require_admin)])
     async def add_project(body: ProjectBody):
@@ -738,6 +962,8 @@ def create_app(root: Path | None = None, polling=True):
                 piece = agent.attachment_content(safe_path(agent.workspace(sid), relative))
                 parts.extend(piece if isinstance(piece, list) else [{"type": "text", "text": piece}])
             content = parts
+        selected = await sync.ensure_topic(selected)
+        await sync.mirror_user(selected, body.text, body.attachments)
         result = agent.submit(selected, content, queue=body.queue)
         if body.request_id:
             store.execute("INSERT INTO message_requests(session_id,request_id,text_hash,created) VALUES (?,?,?,?)", (sid, body.request_id, digest, time.time()))
@@ -747,6 +973,21 @@ def create_app(root: Path | None = None, polling=True):
     async def context_usage(sid: str):
         require_session(sid)
         return agent.context_size(sid)
+
+    @app.get("/api/sessions/{sid}/goal", dependencies=[Depends(require_admin)])
+    async def goal_state(sid: str):
+        require_session(sid)
+        return agent.goal(sid) or agent.blank_goal(sid)
+
+    @app.post("/api/sessions/{sid}/goal", dependencies=[Depends(require_admin)])
+    async def goal_update(sid: str, body: GoalBody):
+        require_session(sid)
+        fields = body.model_dump(exclude_none=True)
+        if body.status is not None and body.status not in GOAL_STATUSES:
+            raise HTTPException(422, "Unknown goal status")
+        if body.steps is not None:
+            fields["steps"] = [step.model_dump() for step in body.steps]
+        return agent.save_goal(sid, source="user", **fields)
 
     @app.get("/api/sessions/{sid}/async-questions", dependencies=[Depends(require_admin)])
     async def async_questions(sid: str):
@@ -799,6 +1040,50 @@ def create_app(root: Path | None = None, polling=True):
         require_session(sid)
         points = store.rows("SELECT id,payload,created FROM usage WHERE session_id=? ORDER BY id", (sid,))
         return {"totals": store.usage(sid), "points": [{"id": r["id"], "created": r["created"], **json.loads(r["payload"])} for r in points]}
+
+    @app.get("/api/sessions/{sid}/map", dependencies=[Depends(require_admin)])
+    async def project_map_state(sid: str):
+        """Latest generated map, job history and the memory text. Reading costs nothing."""
+        require_session(sid)
+        return await asyncio.to_thread(project_map.state, sid)
+
+    @app.get("/api/sessions/{sid}/map/estimate", dependencies=[Depends(require_admin)])
+    async def project_map_estimate(sid: str):
+        """Fresh local inventory plus the token/cost estimate. No provider request is made."""
+        require_session(sid)
+        inventory = await asyncio.to_thread(project_map.inventory, sid)
+        estimate = project_map.estimate(sid, inventory)
+        summary = {k: v for k, v in inventory.items() if k != "records"}
+        return {"inventory": summary, "estimate": estimate, "files": inventory["records"][:2000],
+                "token_test": "Оценка локальная и бесплатная. Кнопка «Проверить на 3 файлах» отправляет "
+                              "один реальный запрос DeepSeek и сохраняет калибровку факт/оценка."}
+
+    @app.post("/api/sessions/{sid}/map/scan", dependencies=[Depends(require_admin)])
+    async def project_map_scan(sid: str, body: MapScanBody):
+        require_session(sid)
+        inventory = await asyncio.to_thread(project_map.inventory, sid)
+        return project_map.start(sid, body.mode, body.max_cost_usd, inventory)
+
+    @app.post("/api/sessions/{sid}/map/probe", dependencies=[Depends(require_admin)])
+    async def project_map_probe(sid: str):
+        """The careful paid test: one small request, actual usage versus estimate."""
+        require_session(sid)
+        return await project_map.probe(sid)
+
+    @app.get("/api/sessions/{sid}/map/jobs", dependencies=[Depends(require_admin)])
+    async def project_map_jobs(sid: str):
+        require_session(sid)
+        return project_map.jobs(sid)
+
+    @app.post("/api/sessions/{sid}/map/jobs/{job_id}/{action}", dependencies=[Depends(require_admin)])
+    async def project_map_control(sid: str, job_id: str, action: str):
+        require_session(sid)
+        if action not in ("pause", "resume", "cancel"):
+            raise HTTPException(404, "Unknown map job action")
+        job = project_map.job(job_id)
+        if not job or job["session_id"] != sid:
+            raise HTTPException(404, "Map job not found")
+        return getattr(project_map, action)(job_id)
 
     @app.get("/api/sessions/{sid}/files", dependencies=[Depends(require_admin)])
     async def files(sid: str):
@@ -873,7 +1158,7 @@ def create_app(root: Path | None = None, polling=True):
     @app.post("/api/sessions/{sid}/files", dependencies=[Depends(require_admin)])
     async def upload(sid: str, file: UploadFile = File(...), kind: str = Form("document"),
                      caption: str = Form(""), send_telegram: bool = Form(False), ask_agent: bool = Form(False)):
-        session = require_session(sid)
+        session = await sync.ensure_topic(require_session(sid))
         if kind not in ("document", "photo", "audio", "voice", "video", "video_note", "animation", "sticker"):
             raise HTTPException(422, "Unknown media kind")
         name = Path(file.filename or "attachment.bin").name.replace("\\", "_").replace(":", "_")
@@ -891,13 +1176,22 @@ def create_app(root: Path | None = None, polling=True):
             raise
         finally:
             await file.close()
-        store.event(sid, "media", {"path": target.name, "kind": kind, "direction": "web"})
         delivered = False
         if send_telegram:
             if not session["chat_id"]:
                 raise HTTPException(409, "File saved; this web session has no Telegram chat")
-            await telegram.media(session, target, kind, caption)
+            # Index the upload before the media event so the mirror does not send it twice.
+            sync.record_result(sid, target, kind, await telegram.media(session, target, kind, caption))
             delivered = True
+        store.event(sid, "media", {"path": target.name, "kind": kind, "direction": "web"})
+        if target.suffix.lower() in (".glb", ".gltf"):
+            # An uploaded model gets its provenance sidecar immediately, with the upload as its source.
+            try:
+                await asyncio.to_thread(models3d.register, sid, target.name,
+                                        {"source": {"tool": "upload", "provider": "web"},
+                                         "prompt": caption[:2000]})
+            except (ModelError, OSError, ValueError):
+                pass
         if ask_agent:
             agent.start(session, agent.attachment_content(target, caption))
         return {"path": target.name, "bytes": size, "telegram_delivered": delivered}

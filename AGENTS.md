@@ -23,6 +23,14 @@ python -m pytest
 python -m ruff check connector tests run.py
 node --check connector/static/app.js
 node --check connector/static/desktop-ui.js
+node --check connector/static/media-ui.js
+node --input-type=module --check < connector/static/viewer3d.js
 ```
+
+`viewer3d.js` is an ES module. `node --check <file>` silently exits 0 on a file containing `import`
+(Node's module detection swallows the parse error), so an ES module must be checked by feeding it to
+`node --input-type=module --check` on stdin. `tests/test_models.py` runs that check when node is
+installed. The vendored three.js under `connector/static/vendor/three/` is upstream code: check it,
+never reformat it.
 
 Build the desktop bundle with `scripts/build-desktop.ps1`. Keep outputs in the project and exclude private runtime state from releases.

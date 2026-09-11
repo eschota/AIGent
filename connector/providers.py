@@ -7,9 +7,11 @@ import httpx
 class ProviderError(Exception):
     """Provider failure. `retryable` marks transient faults worth another attempt."""
 
-    def __init__(self, message, retryable=False):
+    def __init__(self, message, retryable=False, retry_after=0):
         super().__init__(message)
         self.retryable = retryable
+        # Telegram flood control answers 429 with parameters.retry_after seconds.
+        self.retry_after = retry_after
 
 
 def account_usage(raw, model, config, now=None):
@@ -141,7 +143,10 @@ class TelegramAPI:
             response = await self.client.post(url, **kwargs, timeout=65)
             result = response.json()
             if not result.get("ok"):
-                raise ProviderError(self.config.redact(f"Telegram {result.get('error_code')}: {result.get('description')}"))
+                code = result.get("error_code")
+                after = int((result.get("parameters") or {}).get("retry_after") or 0)
+                raise ProviderError(self.config.redact(f"Telegram {code}: {result.get('description')}"),
+                                    retryable=code in (420, 429, 500, 502, 503, 504), retry_after=after)
             return result["result"]
         except (httpx.HTTPError, ValueError) as exc:
             raise ProviderError(f"Сетевая ошибка Telegram ({type(exc).__name__}).") from None

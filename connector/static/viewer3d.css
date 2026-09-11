@@ -1,0 +1,91 @@
+/* Always-mounted 3D dock: model list, viewport and the model passport. Dark Codex-like surface. */
+:root{--viewer3d-height:360px}
+/* The dock never hides the composer: the main column reserves exactly the dock's height. */
+body.viewer3d-open main{padding-bottom:var(--viewer3d-height)}
+.viewer3d-dock{position:fixed;left:0;right:0;bottom:0;height:var(--viewer3d-height);
+  z-index:120;display:grid;grid-template-rows:6px auto 1fr;background:#0a1117;border-top:1px solid var(--line);
+  box-shadow:0 -14px 34px #04080b99}
+.viewer3d-dock[hidden]{display:none}
+.viewer3d-dock.full{top:0;height:auto}
+.viewer3d-dock:focus{outline:none}
+.viewer3d-dock:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.viewer3d-grip{cursor:row-resize;background:linear-gradient(180deg,#16222c,#0a1117)}
+.viewer3d-grip:hover{background:#1d2f3b}
+.viewer3d-header{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:6px 12px;border-bottom:1px solid var(--line)}
+.viewer3d-header strong{letter-spacing:1.4px;font-size:13px;color:var(--accent)}
+.viewer3d-quality{display:flex;gap:4px}
+.viewer3d-header button{background:#111c25;border:1px solid var(--line);color:var(--text);
+  border-radius:6px;padding:3px 9px;font-size:12px;line-height:18px}
+.viewer3d-header button:hover{background:#172733}
+.viewer3d-header button.active{border-color:var(--accent);color:var(--accent);background:#12302a}
+.viewer3d-channel{background:#111c25;border:1px solid var(--line);color:var(--text);border-radius:6px;
+  padding:3px 6px;font-size:12px;max-width:230px}
+.viewer3d-nomap{font-size:11px;color:var(--purple);border:1px dashed var(--line);border-radius:5px;padding:2px 7px}
+.viewer3d-auto{display:flex;align-items:center;gap:5px;font-size:12px;color:var(--muted);margin-left:auto}
+.viewer3d-toggles{display:flex;gap:4px;flex-wrap:wrap}
+.viewer3d-body{display:grid;grid-template-columns:224px 1fr 290px;min-height:0}
+.viewer3d-list,.viewer3d-provenance{overflow:auto;padding:8px 10px;display:flex;flex-direction:column;gap:7px;
+  border-right:1px solid var(--line);min-height:0}
+.viewer3d-provenance{border-right:0;border-left:1px solid var(--line)}
+.viewer3d-list-head{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:11px;
+  letter-spacing:1.2px;text-transform:uppercase;color:var(--muted)}
+.viewer3d-list-head button{background:none;border:0;color:var(--accent);padding:0 4px}
+.viewer3d-item{display:grid;grid-template-columns:46px 1fr;gap:8px;align-items:center;text-align:left;
+  background:#101a22;border:1px solid var(--line);border-radius:8px;padding:6px;color:var(--text)}
+.viewer3d-item:hover{background:#16232d}
+.viewer3d-item.selected{border-color:var(--accent)}
+.viewer3d-thumb{display:grid;place-items:center;width:46px;height:46px;border-radius:6px;background:#0a1117;
+  color:var(--muted);font-size:10px;overflow:hidden}
+.viewer3d-thumb img{width:100%;height:100%;object-fit:cover}
+.viewer3d-item-meta{display:grid;gap:2px;min-width:0}
+.viewer3d-item-meta strong{font-size:12px;overflow-wrap:anywhere}
+.viewer3d-item-meta small{font-size:11px;color:var(--muted)}
+.viewer3d-warn{color:var(--purple)}
+.viewer3d-stage{position:relative;min-width:0;min-height:0;background:#05090d;display:grid}
+.viewer3d-canvas{display:block;width:100%;height:100%;grid-area:1/1;outline:none}
+.viewer3d-stats{grid-area:1/1;align-self:start;justify-self:start;margin:8px;padding:3px 8px;border-radius:6px;
+  background:#0b1016cc;border:1px solid var(--line);color:var(--muted);font-size:11px;pointer-events:none}
+.viewer3d-message{grid-area:1/1;align-self:center;justify-self:center;max-width:70%;text-align:center;
+  padding:10px 16px;border-radius:8px;background:#0b1016dd;border:1px solid var(--line);color:var(--muted);font-size:13px}
+.viewer3d-message[hidden]{display:none}
+.viewer3d-field{display:flex;justify-content:space-between;gap:10px;font-size:12px;border-bottom:1px dotted #1e2b35;padding-bottom:2px}
+.viewer3d-field span{color:var(--muted)}
+.viewer3d-field strong{font-weight:500;overflow-wrap:anywhere;text-align:right}
+.viewer3d-provenance label{display:grid;gap:3px;font-size:11px;color:var(--muted)}
+.viewer3d-provenance textarea,.viewer3d-provenance input{background:#0a1117;border:1px solid var(--line);
+  color:var(--text);border-radius:6px;padding:5px 7px;font:inherit;font-size:12px;width:100%}
+.viewer3d-provenance button{background:#111c25;border:1px solid var(--line);color:var(--text);border-radius:6px;
+  padding:5px 9px;font-size:12px}
+.viewer3d-provenance button.primary{border-color:var(--accent);color:var(--accent)}
+.viewer3d-references{display:flex;flex-wrap:wrap;gap:6px}
+.viewer3d-references .viewer3d-list-head{flex-basis:100%}
+.viewer3d-reference{display:grid;gap:3px;width:74px;background:#101a22;border:1px solid var(--line);
+  border-radius:7px;padding:4px;color:var(--muted);font-size:10px}
+.viewer3d-reference img{width:100%;height:56px;object-fit:cover;border-radius:4px;background:#0a1117}
+.viewer3d-history{font-size:11px;color:var(--muted)}
+.viewer3d-history div{padding:2px 0;border-bottom:1px dotted #1e2b35;overflow-wrap:anywhere}
+.viewer3d-provenance pre{white-space:pre-wrap;font-size:11px;max-height:240px;overflow:auto}
+.viewer3d-picker{background:#0a1117;color:var(--text);border:1px solid var(--line);border-radius:10px;padding:14px;max-width:760px}
+.viewer3d-picker-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(96px,1fr));gap:8px;
+  max-height:60vh;overflow:auto;margin:10px 0}
+.viewer3d-picker-list button{display:grid;gap:4px;background:#101a22;border:1px solid var(--line);
+  border-radius:7px;padding:5px;color:var(--muted);font-size:10px}
+.viewer3d-picker-list img{width:100%;height:74px;object-fit:cover;border-radius:5px}
+/* The 3D card inside the chat feed (rendered by media-ui.js) and the video loop switch. */
+.media-card.model .media-frame{display:grid;place-items:center;align-content:center;gap:4px;background:#0c161d}
+.media-3d-mark{font-size:38px;color:var(--accent);line-height:1}
+.media-3d-format{font-size:11px;letter-spacing:1.6px;color:var(--muted)}
+.media-actions button.on{color:var(--accent)}
+
+@media(max-width:1100px){
+  .viewer3d-body{grid-template-columns:170px 1fr}
+  .viewer3d-provenance{display:none}
+  .viewer3d-dock.full .viewer3d-body{grid-template-columns:170px 1fr}
+  .viewer3d-dock.full .viewer3d-provenance{display:flex}
+}
+@media(max-width:700px){
+  :root{--viewer3d-height:300px}
+  .viewer3d-body{grid-template-columns:1fr}
+  .viewer3d-list{display:none}
+  .viewer3d-dock.full .viewer3d-list{display:flex}
+}

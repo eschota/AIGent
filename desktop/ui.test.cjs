@@ -319,3 +319,66 @@ test('the skill widget reports index progress on hover and attaches a skill into
   assert.equal(hover.hidden,true);
   dom.window.close();
 });
+
+// --- Interactive media: cards, grouping and the lightbox (needs jsdom; see README checks) ---
+test('media events become interactive cards, group into one grid and open a lightbox',async()=>{
+  const {dom,w,event}=withScripts('media-ui.js');
+  vm.runInContext("current={id:'media-fixture',status:'idle',provider:'deepseek'};",dom.getInternalVMContext());
+  const {fetch}=router({'/media/info':{kind:'image',width:1280,height:720,bytes:2048,duration:null}});
+  w.fetch=fetch;
+  event('user',{text:'Нарисуй три кадра'});
+  event('media',{path:'shared/one.png',kind:'image',direction:'generated'});
+  event('media',{path:'shared/two.png',kind:'image',direction:'vision'});
+  event('media',{path:'shared/clip.mp4',kind:'video',direction:'generated'});
+  const d=w.document;
+  assert.equal(d.querySelectorAll('.media-grid').length,1,'consecutive media share one responsive grid');
+  const cards=d.querySelectorAll('.media-card');
+  assert.equal(cards.length,3);
+  assert.match(cards[0].querySelector('img').src,/variant=thumb/);
+  assert.match(cards[0].querySelector('img').src,/path=shared%2Fone\.png/);
+  assert.match(cards[1].textContent,/Агент посмотрел/);
+  assert.equal(cards[2].dataset.kind,'video');
+  assert.ok(cards[2].querySelector('.media-play'),'a clip shows a play control on its poster');
+  assert.ok([...cards[2].querySelectorAll('button')].some(b=>/лайтбокс/i.test(b.textContent)));
+  assert.match(cards[0].querySelector('.media-actions a').href,/variant=original/);
+
+  cards[0].querySelector('.media-frame').click();
+  await tick(2);
+  const box=d.querySelector('.media-lightbox');
+  assert.ok(box,'clicking an image opens the lightbox');
+  assert.match(box.querySelector('.media-stage img').src,/variant=preview/);
+  box.querySelector('.media-stage img').click();
+  assert.equal(box.querySelector('.media-stage img').classList.contains('zoomed'),true,'a second click zooms 1:1');
+  d.dispatchEvent(new w.KeyboardEvent('keydown',{key:'ArrowRight',bubbles:true}));
+  await tick(2);
+  assert.equal(d.querySelector('.media-lightbox').dataset.path,'shared/two.png','arrows walk the chat gallery');
+  d.dispatchEvent(new w.KeyboardEvent('keydown',{key:'Escape',bubbles:true}));
+  assert.equal(d.querySelector('.media-lightbox'),null,'Esc closes it');
+  dom.window.close();
+});
+
+test('a video card waits for the transcode and then plays inline',async()=>{
+  const {dom,w}=withScripts('media-ui.js');
+  let status=202;
+  w.fetch=async(url,options={})=>{
+    if(url.includes('/media/info'))return new Response(JSON.stringify({kind:'video',width:640,height:360,bytes:4096,duration:15}),{status:200,headers:{'content-type':'application/json'}});
+    if(options.method==='HEAD')return new Response(null,{status});
+    return new Response('{}',{status:200,headers:{'content-type':'application/json'}});
+  };
+  const card=w.MediaUI.render('vid-fixture','shared/clip.mp4',{kind:'video',direction:'generated'});
+  w.document.body.append(card);
+  card.querySelector('.media-frame').click();
+  await tick(4);
+  const badge=card.querySelector('.media-badge');
+  assert.equal(badge.hidden,false,'a running transcode shows progress instead of a broken player');
+  assert.match(badge.textContent,/Перекодирование|Готовим/);
+  status=200;
+  await new Promise(r=>setTimeout(r,2100));
+  await tick(6);
+  const player=card.querySelector('video');
+  assert.ok(player,'the ready preview replaces the poster with a player');
+  assert.match(player.src,/variant=preview/);
+  assert.equal(player.controls,true);
+  assert.match(card.querySelector('.media-meta').textContent,/640×360 · 0:15/);
+  dom.window.close();
+});

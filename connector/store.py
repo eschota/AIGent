@@ -6,6 +6,8 @@ import uuid
 
 class Store:
     def __init__(self, path, recover=False):
+        # Synchronous observers of event(); a failing observer never breaks the journal.
+        self.observers = []
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.executescript("""
@@ -40,6 +42,14 @@ class Store:
           id TEXT PRIMARY KEY, path TEXT UNIQUE, name TEXT, title TEXT, summary TEXT,
           source TEXT, origin TEXT, tags TEXT DEFAULT '[]', digest TEXT, bytes INTEGER,
           modified REAL, indexed REAL, uses INTEGER DEFAULT 0, used_at REAL, analysis TEXT DEFAULT 'local');
+        CREATE TABLE IF NOT EXISTS sync_state (
+          session_id TEXT PRIMARY KEY, chat_id INTEGER, topic_id INTEGER,
+          header_message_id INTEGER, last_event_id INTEGER DEFAULT 0,
+          status TEXT DEFAULT 'pending', updated REAL);
+        CREATE TABLE IF NOT EXISTS media_files (
+          id INTEGER PRIMARY KEY, session_id TEXT, path TEXT, sha256 TEXT, file_id TEXT,
+          file_unique_id TEXT, kind TEXT, size INTEGER, message_id INTEGER, uploaded_at REAL);
+        CREATE UNIQUE INDEX IF NOT EXISTS media_files_path ON media_files(session_id, path);
         CREATE TABLE IF NOT EXISTS async_questions (
           id TEXT PRIMARY KEY, session_id TEXT, question TEXT, assumption TEXT,
           created REAL, closed REAL, status TEXT DEFAULT 'open', answer TEXT);
@@ -115,9 +125,67 @@ class Store:
                      (sid, *args, title[:100], time.time()))
         return self.session(sid)
 
+    def topic_session(self, chat, topic, user=None):
+        """The session bound to a forum topic, whoever created it.
+
+        A session mirrored from the IDE starts with user_id 0; the first authorized Telegram
+        writer in its topic adopts it, so both sides continue the same conversation.
+        """
+        rows = self.rows("SELECT * FROM sessions WHERE chat_id=? AND topic_id=? AND deleted=0 "
+                         "AND active=1 ORDER BY created DESC", (chat, topic or 0))
+        owned = [r for r in rows if user is not None and r["user_id"] == user]
+        shared = [r for r in rows if not r["user_id"]]
+        found = (owned or shared)
+        if not found:
+            return None
+        session = found[0]
+        if user is not None and not session["user_id"]:
+            self.execute("UPDATE sessions SET user_id=? WHERE id=?", (user, session["id"]))
+            session = self.session(session["id"])
+        return session
+
+    def sync_state(self, sid):
+        rows = self.rows("SELECT * FROM sync_state WHERE session_id=?", (sid,))
+        return rows[0] if rows else None
+
+    def set_sync_state(self, sid, **fields):
+        if not self.sync_state(sid):
+            self.execute("INSERT INTO sync_state(session_id,updated) VALUES (?,?)", (sid, time.time()))
+        if fields:
+            allowed = {"chat_id", "topic_id", "header_message_id", "last_event_id", "status"}
+            if not set(fields) <= allowed:
+                raise ValueError("Invalid sync fields")
+            self.execute("UPDATE sync_state SET " + ",".join(f"{k}=?" for k in fields) +
+                         ",updated=? WHERE session_id=?", (*fields.values(), time.time(), sid))
+        return self.sync_state(sid)
+
+    def media_file(self, sid, path):
+        rows = self.rows("SELECT * FROM media_files WHERE session_id=? AND path=?", (sid, path))
+        return rows[0] if rows else None
+
+    def media_files(self, sid):
+        return self.rows("SELECT * FROM media_files WHERE session_id=? ORDER BY id", (sid,))
+
+    def record_media(self, sid, path, **fields):
+        columns = ("sha256", "file_id", "file_unique_id", "kind", "size", "message_id")
+        values = [fields.get(c) for c in columns]
+        self.execute("INSERT INTO media_files(session_id,path,sha256,file_id,file_unique_id,kind,size,"
+                     "message_id,uploaded_at) VALUES (?,?,?,?,?,?,?,?,?) "
+                     "ON CONFLICT(session_id,path) DO UPDATE SET sha256=excluded.sha256,"
+                     "file_id=excluded.file_id,file_unique_id=excluded.file_unique_id,kind=excluded.kind,"
+                     "size=excluded.size,message_id=excluded.message_id,uploaded_at=excluded.uploaded_at",
+                     (sid, path, *values, time.time()))
+        return self.media_file(sid, path)
+
     def event(self, sid, kind, payload):
-        self.execute("INSERT INTO events(session_id,kind,payload,created) VALUES (?,?,?,?)",
-                     (sid, kind, json.dumps(payload, ensure_ascii=False), time.time()))
+        cur = self.execute("INSERT INTO events(session_id,kind,payload,created) VALUES (?,?,?,?)",
+                           (sid, kind, json.dumps(payload, ensure_ascii=False), time.time()))
+        for observer in list(self.observers):
+            try:
+                observer(sid, kind, payload, cur.lastrowid)
+            except Exception:
+                pass  # Mirroring is best effort; the event journal is the source of truth.
+        return cur.lastrowid
 
     def events(self, sid, after=0):
         rows = self.rows("SELECT * FROM events WHERE session_id=? AND id>? ORDER BY id LIMIT 500",

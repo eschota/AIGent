@@ -10,7 +10,8 @@ from .providers import ProviderError, usage_text
 HELP = ("AIGent\n/new [название] — новая сессия / топик\n"
         "/providers — выбрать аккаунт Codex / Claude / DeepSeek\n"
         "/sessions — ваши сессии\n/resume ID — продолжить сессию\n"
-        "/usage — токены и экономия\n/balance — баланс API\n/stop — остановить ход\n"
+        "/usage — токены и экономия\n/balance — баланс API\n/status — состояние сессии\n"
+        "/stop — остановить ход\n"
         "/logout — выйти\nОтправляйте текст, изображения, документы, аудио и видео.\n"
         "Изменения файлов требуют подтверждения. Команды подтверждает администратор.")
 
@@ -106,8 +107,10 @@ class Bot:
                 await self.api.text(route, ("Неверный пароль. " if password else "") +
                                     "Введите пароль доступа отдельным сообщением или /auth пароль. Пароль задаётся в админке.")
             return
-        session = self.store.resolve(chat["id"], topic, uid,
-                                     message.get("forum_topic_created", {}).get("name", "Telegram session"))
+        title = message.get("forum_topic_created", {}).get("name", "Telegram session")
+        # A topic mirrored from the IDE has no Telegram owner yet: the first authorized writer
+        # continues that same session instead of starting a parallel one.
+        session = self.store.topic_session(chat["id"], topic, uid) or self.store.resolve(chat["id"], topic, uid, title)
         sid = session["id"]
         if command in ("/start", "/help"):
             await self.api.text(session, f"Сессия {sid}\n" + HELP)
@@ -179,6 +182,22 @@ class Bot:
                     f"{b['currency']}: {b['total_balance']}" for b in balance.get("balance_infos", [])))
             except (ProviderError, Exception) as exc:
                 await self.api.text(session, self.config.redact(exc) if isinstance(exc, ProviderError) else "Баланс временно недоступен.")
+        elif command == "/status":
+            sync = getattr(self.agent, "sync", None)
+            context = self.agent.context_size(sid) if session.get("provider", "deepseek") == "deepseek" else {}
+            pending = len(self.store.queued(sid))
+            lines = [f"Сессия {sid} · {session['title']}",
+                     f"Провайдер: {session.get('provider', 'deepseek')} · модель: {session.get('model') or 'по умолчанию'}",
+                     f"Проект: {session.get('workspace') or 'отдельная папка сессии'}",
+                     f"Состояние: {'ход выполняется' if self.agent.busy(sid) else session.get('status', 'idle')}",
+                     f"Очередь: {pending}"]
+            if context:
+                lines.append(f"Контекст: {context['percent']}% от лимита ({context['chars']} символов)")
+            if sync:
+                state = sync.info(session)
+                lines.append(f"Медиа в Telegram: {state['media_in_telegram']}/{state['media_count']} · "
+                             f"в очереди загрузки: {state['pending_uploads']}")
+            await self.api.text(session, "\n".join(lines))
         elif command == "/stop":
             stopped = self.agent.stop(sid)
             await self.api.text(session, "Останавливаю ход." if stopped else "В этой сессии нет активного хода.")
@@ -216,7 +235,12 @@ class Bot:
                     structured = {k: v for k, v in message.items() if k not in ("from", "chat")}
                     self.store.event(sid, "telegram_payload", structured)
                     content = "Telegram structured message: " + json.dumps(structured, ensure_ascii=False)[:16000]
-                self.agent.start(session, content)
+                result = self.agent.submit(session, content)
+                if result.get("queued"):
+                    # Show the message in the IDE immediately; the turn event follows when it starts.
+                    self.store.event(sid, "user", {"text": self.agent.plain_text(content), "queued": True,
+                                                   "source": "telegram"})
+                    await self.api.text(session, f"Сообщение принято в очередь, позиция {result['position']}.")
             except (ValueError, ProviderError) as exc:
                 await self.api.text(session, str(exc))
 
@@ -240,7 +264,8 @@ class Bot:
                             ("start", "Начать работу / авторизация"), ("new", "Новая сессия"),
                             ("sessions", "Список сессий"), ("usage", "Токены и кеш"),
                             ("providers", "Аккаунты Codex / Claude / DeepSeek"),
-                            ("balance", "Баланс DeepSeek"), ("stop", "Остановить"), ("help", "Помощь"),
+                            ("balance", "Баланс DeepSeek"), ("status", "Состояние сессии"),
+                            ("stop", "Остановить"), ("help", "Помощь"),
                             ("logout", "Выйти"))]})
                     token = self.config["telegram_token"]
                 self.status, self.last_error = "online", ""

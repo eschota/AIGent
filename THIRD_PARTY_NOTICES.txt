@@ -798,3 +798,50 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
+
+
+========================================================================
+three.js r187dev (MIT) - vendored subset in connector/static/vendor/three
+
+Source: https://github.com/mrdoob/three.js, commit a09daaefa77dcbf83a685d399ae062b62afef076 (2026-09-11).
+Vendored: lib/three.module.js + lib/three.core.js, and the addons the 3D viewer imports
+(GLTFLoader, DRACOLoader, KTX2Loader, OrbitControls, RoomEnvironment, BufferGeometryUtils,
+EffectComposer with RenderPass/ShaderPass/OutputPass/UnrealBloomPass/SSAOPass/SMAAPass/FXAAPass
+and their shaders) plus the DRACO and Basis/KTX2 decoders under addons/libs. The build/ folder was renamed to lib/ (the repository ignores build/); bare "three" import
+specifiers were rewritten to relative paths because the page CSP forbids import maps; no other
+change was made to the sources. Examples, textures and unused addons are not redistributed.
+
+The MIT License
+
+Copyright © 2010-2026 three.js authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+
+========================================================================
+Draco 3D Data Compression decoder (Apache License 2.0)
+
+connector/static/vendor/three/addons/libs/draco/gltf/* - decoder build redistributed with three.js.
+Source and licence: https://github.com/google/draco (Apache License 2.0).
+
+========================================================================
+Basis Universal transcoder (Apache License 2.0)
+
+connector/static/vendor/three/addons/libs/basis/* - KTX2/Basis transcoder redistributed with three.js.
+Source and licence: https://github.com/BinomialLLC/basis_universal (Apache License 2.0).

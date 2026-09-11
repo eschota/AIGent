@@ -395,6 +395,7 @@ class FarmClient:
 
     def stream(self, method, url, **kwargs):
         self.calls.append((method, url))
+        self.bodies.append({})  # keep calls and bodies index-aligned for the assertions below
         return FarmResponse(chunks=[self.image])
 
 
@@ -475,7 +476,7 @@ async def test_farm_video_renders_from_a_frame_and_survives_a_restart(bundle):
     assert media["payload"]["kind"] == "video"
     assert any(url.endswith("/dev/api/scratch") for _, url in client.calls), "the frame is published before rendering"
     # the owner asked for a 16:8 frame, five seconds long, without passing either field
-    rendered = [body for (_, url), body in zip(client.calls, client.bodies)
+    rendered = [body for (_, url), body in zip(client.calls, client.bodies, strict=True)
                 if url.endswith("/renderfin/api-render")]
     assert rendered[-1]["frame_count"] == 121, "an omitted length is five seconds"
     assert (rendered[-1]["main_size_width"], rendered[-1]["main_size_height"]) == (512, 256)

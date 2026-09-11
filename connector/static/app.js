@@ -20,6 +20,34 @@ async function api(path, options = {}) {
 }
 function handle(fn) {return async (e) => {if (e?.preventDefault) e.preventDefault(); try {await fn(e);} catch (error) {toast(error.message);}};}
 function setText(id, value) {$(id).textContent = value;}
+function richText(target, text) {
+  // DOM-only Markdown subset: never inject model-authored HTML.
+  function inline(parent, value) {
+    const pattern = /(`([^`]+)`|\*\*([^*]+)\*\*|\[([^\]]+)\]\((https?:\/\/[^\s)]+)\))/g;
+    let cursor=0, match;
+    while ((match=pattern.exec(value))) {
+      parent.append(document.createTextNode(value.slice(cursor,match.index)));
+      if(match[2])parent.append(el('code',match[2]));
+      else if(match[3])parent.append(el('strong',match[3]));
+      else {const link=el('a',match[4]);link.href=match[5];link.target='_blank';link.rel='noreferrer noopener';parent.append(link);}
+      cursor=pattern.lastIndex;
+    }
+    parent.append(document.createTextNode(value.slice(cursor)));
+  }
+  let paragraph=[], list=null, code=null;
+  function flush(){if(paragraph.length){const p=el('p');inline(p,paragraph.join('\n'));target.append(p);paragraph=[];}list=null;}
+  for(const line of text.split('\n')) {
+    if(line.startsWith('```')) {flush();if(code){target.append(el('pre',code.join('\n'),'code-block'));code=null;}else code=[];continue;}
+    if(code){code.push(line);continue;}
+    if(!line.trim()){flush();continue;}
+    const item=line.match(/^\s*[-*] (.*)$/);
+    if(item){if(paragraph.length)flush();if(!list){list=el('ul');target.append(list);}const li=el('li');inline(li,item[1]);list.append(li);continue;}
+    const heading=line.match(/^#{1,4} (.*)$/);
+    if(heading){flush();const h=el('h3');inline(h,heading[1]);target.append(h);continue;}
+    if(list)list=null;paragraph.push(line);
+  }
+  flush();if(code)target.append(el('pre',code.join('\n'),'code-block'));
+}
 async function refresh() {
   const [status, sessions, approvals] = await Promise.all([api('/api/status'), api('/api/sessions'), api('/api/approvals')]);
   allSessions = sessions;
@@ -97,7 +125,8 @@ function renderEvent(event) {
       const details = el('details'); details.append(el('summary', p.name || kind), el('pre', JSON.stringify(p.arguments || p.result || p, null, 2))); node.append(details);
     } else if (kind === 'media' && p.path) {
       const a = el('a', p.path); a.href = `/api/sessions/${current.id}/file?path=${encodeURIComponent(p.path)}`; node.append(a, el('small', ' · ' + p.direction));
-    } else node.append(el('pre', p.text || JSON.stringify(p, null, 2)));
+    } else if (kind === 'assistant') {const body=el('div',undefined,'rich-message');richText(body,p.text||'');node.append(body);}
+    else node.append(el('pre', p.text || JSON.stringify(p, null, 2)));
     $('events').append(node);
   }
   if (nearBottom) $('chat-panel').scrollTop = $('chat-panel').scrollHeight;
@@ -124,12 +153,12 @@ function svgNode(tag, attrs, text) {const n = document.createElementNS('http://w
 async function loadUsage() {
   if (!current) return;
   const data = await api(`/api/sessions/${current.id}/usage`); updateSessionStats(data.totals); setText('usage-session-id', current.id);
-  const points = data.points.slice(-80), svg = svgNode('svg', {viewBox:'0 0 800 220', role:'img', 'aria-label':'Токены по запросам: cache hit, cache miss и output'});
+  const points = data.points.slice(-80), chartWidth=Math.max(300,$('chart').clientWidth), svg = svgNode('svg', {viewBox:`0 0 ${chartWidth} 220`, role:'img', 'aria-label':'Токены по запросам: cache hit, cache miss и output'});
   const max = Math.max(1, ...points.map(p => p.prompt_tokens + p.completion_tokens));
-  for (let i=0;i<4;i++) {const y=180-i*50;svg.append(svgNode('line',{x1:55,x2:790,y1:y,y2:y,stroke:'#26313b'}),svgNode('text',{x:0,y:y+4},fmt(Math.round(max*i/3))));}
-  const width=720/Math.max(1,points.length);
+  for (let i=0;i<4;i++) {const y=180-i*50;svg.append(svgNode('line',{x1:55,x2:chartWidth-5,y1:y,y2:y,stroke:'#353535'}),svgNode('text',{x:0,y:y+4},fmt(Math.round(max*i/3))));}
+  const width=(chartWidth-65)/Math.max(1,points.length);
   points.forEach((p,i) => {let y=180; const x=60+i*width; for (const [value,color] of [[p.cache_hit_tokens||0,'#b6d3bd'],[p.cache_miss_tokens??p.prompt_tokens,'#ababd2'],[p.completion_tokens,'#ceb9a9']]) {const h=value/max*150; y-=h; const rect=svgNode('rect',{x,y,width:Math.max(2,width*.65),height:h,rx:2,fill:color});rect.append(svgNode('title',{},`#${p.id}: ${fmt(value)} tokens`));svg.append(rect);} if(points.length<16||i%10===0)svg.append(svgNode('text',{x,y:207},String(i+1)));});
-  if (!points.length) svg.append(svgNode('text',{x:260,y:95},'График появится после первого запроса'));
+  if (!points.length) svg.append(svgNode('text',{x:60,y:95},'Нет запросов'));
   $('chart').replaceChildren(svg);
   $('usage-table').replaceChildren(...data.points.slice(-100).reverse().map(p => {const row=el('tr'); [new Date(p.created*1000).toLocaleTimeString(),p.model,fmt(p.cache_hit_tokens),fmt(p.cache_miss_tokens),fmt(p.completion_tokens),money(p.cost_usd)].forEach(x=>row.append(el('td',x)));return row;}));
 }

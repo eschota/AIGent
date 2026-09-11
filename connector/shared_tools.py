@@ -29,6 +29,7 @@ TIMEOUTS = {"image": 1800, "video": 3600}
 FPS = 25
 MAX_FRAMES = 300  # RenderPrompt.frame_count is clamped to 300 by the farm API
 VIDEO_SIZE_STEP = 32  # routing.clamp_video_dims: 64..512 in multiples of 32
+DEFAULT_VIDEO_SIZE = "512x256"  # 16:8 — the frame ratio the owner wants for clips
 POLL_SECONDS = 10
 
 
@@ -53,7 +54,7 @@ class SharedTools:
              "fields": [{"name": "path", "label": "Файл изображения в рабочей папке", "type": "text", "required": True},
                         {"name": "prompt", "label": "Движение камеры и сцены", "type": "text", "required": False},
                         {"name": "frames", "label": "Кадров при 25 fps: 121 ≈ 5 с, 241 ≈ 10 с, 301 ≈ 12 с", "type": "text", "required": False},
-                        {"name": "size", "label": "Размер кадра, например 512x288 (64–512, шаг 32)", "type": "text", "required": False},
+                        {"name": "size", "label": "Размер кадра; по умолчанию 512x256 (16:8), 64–512 с шагом 32", "type": "text", "required": False},
                         {"name": "work_flow", "label": "Воркфлоу фермы (пусто = по умолчанию)", "type": "text", "required": False}],
              "billing": "free-farm", "background": True, "providers": "any"},
             {"name": "skill", "title": "Приложить скилл",
@@ -69,7 +70,7 @@ class SharedTools:
                                  "Works in any session and costs no model tokens.", {"prompt": STRING}, ["prompt"]),
             tool("shared_video", "Animate an existing workspace image on the connected free farm and receive the mp4 "
                                  "in this chat. frames is the clip length at 25 fps (121 ~ 5 s, 241 ~ 10 s) and size is "
-                 "WIDTHxHEIGHT up to 512x512; a deployment whose template lacks the $frames placeholder "
+                 "WIDTHxHEIGHT up to 512x512, default 512x256 (16:8); a deployment whose template lacks the $frames placeholder "
                  "renders its built-in length instead. A render may take 20+ minutes; the tool waits and survives a restart. "
                                  "Never poll the farm with a shell command.",
                  {"path": STRING, "prompt": STRING, "work_flow": STRING, "size": STRING,
@@ -177,7 +178,7 @@ class SharedTools:
 
     @staticmethod
     def video_size(value):
-        """Farm video dimensions: 64..512, multiples of 32."""
+        """Farm video dimensions: 64..512, multiples of 32; empty means the 16:8 default."""
         if not value:
             return 0, 0
         try:
@@ -212,7 +213,7 @@ class SharedTools:
         count = self.video_frames(frames)
         if count:
             body["frame_count"] = count
-        width, height = self.video_size(size)
+        width, height = self.video_size(size or DEFAULT_VIDEO_SIZE)
         if width:
             body["main_size_width"], body["main_size_height"] = width, height
         submitted = await self.request("POST", "/renderfin/api-render", json=body)

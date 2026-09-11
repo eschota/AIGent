@@ -35,7 +35,10 @@ test('a multi-step turn groups tools, preserves arguments/results and totals usa
   assert.equal(d.querySelector('.turn-work').open,false);
   assert.equal(d.querySelector('.turn-reasoning').open,false);
   assert.match(d.querySelector('.turn-reasoning pre').textContent,/step 7/);
-  assert.match(d.querySelector('.turn-tool').textContent,/contents 0/);
+  const firstTool=d.querySelector('.turn-tool');
+  assert.doesNotMatch(firstTool.textContent,/contents 0/,'a closed row does not build its JSON view');
+  firstTool.open=true;firstTool.dispatchEvent(new w.Event('toggle'));
+  assert.match(firstTool.textContent,/contents 0/,'opening the row renders the result');
   assert.equal(d.querySelectorAll('.event.assistant').length,1);
   dom.window.close();
 });

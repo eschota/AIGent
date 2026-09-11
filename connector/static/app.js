@@ -379,10 +379,11 @@ function renderTool(t,p,isResult) {
   let item=id?t.tools.find(x=>x.id===id):null;
   if(!item&&isResult&&!id)item=t.tools.find(x=>!x.done&&x.name===p.name);
   if(!item){const row=el('details',undefined,'turn-tool'),label=el('summary'),body=el('div');row.append(label,body);t.actions.append(row);item={id,name:p.name,row,label,body,done:false};t.tools.push(item);}
-  if(!isResult){item.args=p.arguments||{};structured(item.body,item.args);}
+  if(!isResult){item.args=p.arguments||{};lazyStructured(item.row,item.body,item.args);}
   else {item.done=true;item.failed=!!(p.result?.error||p.result?.is_error||p.result?.status==='failed'||(p.result?.exit_code!=null&&p.result.exit_code!==0));
         const output=p.result&&typeof p.result==='object'&&typeof p.result.output==='string'?p.result.output:null;
-        structured(item.body,p.result);
+        const body=el('div');item.body.append(body);
+        lazyStructured(item.row,body,p.result);
         if(output)item.body.append(el('pre',output.slice(0,8000),'code-block'));}
   const a=item.args||{},target=a.path||a.pattern||a.query||a.command||a.cmd||'';
   item.label.textContent=(item.done?(item.failed?'! ':'✓ '):'◌ ')+(toolNames[item.name]||item.name)+(target?' · '+String(target).slice(0,150):'');
@@ -430,7 +431,8 @@ function renderEvent(event) {
   } else if(kind==='usage')renderTurnUsage(t,p);
   else if(kind==='tool'||kind==='tool_result')renderTool(t,p,kind==='tool_result');
   else if(['context','provider_session','telegram_payload'].includes(kind)){
-    const detail=el('details',undefined,'turn-detail');const summary=el('summary',p.text||'Данные подключения');detail.append(summary);structured(detail,p);t.actions.append(detail);t.work.hidden=false;
+    const detail=el('details',undefined,'turn-detail');const summary=el('summary',p.text||'Данные подключения');detail.append(summary);
+    const body=el('div');detail.append(body);lazyStructured(detail,body,p);t.actions.append(detail);t.work.hidden=false;
   } else {
     node = el('article', undefined, 'event ' + kind);
     const names = {user:'ВЫ', assistant:(p.provider||current?.provider||'deepseek').toUpperCase(), tool:'ДЕЙСТВИЕ', tool_result:'РЕЗУЛЬТАТ', media:'ВЛОЖЕНИЕ', error:'ОШИБКА', context:'КОНТЕКСТ', notice:'СОБЫТИЕ', usage:'USAGE'};
@@ -625,6 +627,13 @@ function renderJson(target,value,depth=0){
   }
   const text=type==='string'?'"'+value+'"':String(value);
   target.append(el('span',text,'json-'+type));
+}
+function lazyStructured(details,target,value){
+  // A long history holds thousands of tool results; render each one when its row is opened.
+  let rendered=false;
+  const draw=()=>{if(rendered||!details.open)return;rendered=true;structured(target,value);};
+  details.addEventListener('toggle',draw);
+  if(details.open)draw();
 }
 function structured(target,value){
   let data=value;

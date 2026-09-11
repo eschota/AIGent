@@ -30,8 +30,9 @@ Use shared_video(path, prompt, frames, size) for it. Never poll the farm with a 
 a run_command times out long before a render finishes, while shared_video waits inside the tool,
 keeps the chat free and survives a connector restart.
 frames counts at 25 fps and must be 8*k+1 (121 ~ 5 s, 241 ~ 10 s, 297 ~ 12 s, the API cap);
-size is WIDTHxHEIGHT within 64..512 in steps of 32. Both only take effect when the deployed
-template carries $frames/$width/$height; otherwise the workflow renders its built-in length,
+size is WIDTHxHEIGHT within 64..512 in steps of 32, and an omitted size now defaults to
+512x256 (16:8). Both only take effect when the deployed template carries
+$frames/$width/$height; otherwise the workflow renders its built-in length,
 which is 49 frames at 384x224, about two seconds.
 
 "render artifact quality rejected ... real_output_artifact_missing: history contains no

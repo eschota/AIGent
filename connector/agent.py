@@ -1271,8 +1271,12 @@ class Agent:
                         try:
                             args = json.loads(call["function"]["arguments"])
                             signature = canonical_call(name, args)
-                            budget["repeats"][signature] = budget["repeats"].get(signature, 0) + 1
-                            if budget["repeats"][signature] >= 3:
+                            # Reading more output of a running command is waiting, not a loop: the same
+                            # write_stdin poll repeats until the command ends, and must never be refused.
+                            polling = name == "write_stdin" and not (isinstance(args, dict) and args.get("chars"))
+                            if not polling:
+                                budget["repeats"][signature] = budget["repeats"].get(signature, 0) + 1
+                            if budget["repeats"].get(signature, 0) >= 3:
                                 result = {"error": "Repeated identical call; change approach or explain to the "
                                                    "user why it is needed.", "loop_guard": True}
                                 self.store.event(sid, "notice", {"text": f"Повтор одного и того же вызова {name} "

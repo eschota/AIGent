@@ -1084,3 +1084,36 @@ async def test_read_file_reads_a_line_range_of_a_big_file_and_caches_per_range(b
     beyond = await agent.execute(session, "read_file", {"path": "big.txt", "start": 40000, "lines": 5})
     assert beyond["text"] == "" and beyond["range"] == [40000, 39999], "an empty range is honest, not an error"
 
+
+async def test_polling_a_running_command_is_not_a_loop(bundle):
+    """Waiting for pytest through write_stdin repeated the same call and the guard refused the 3rd."""
+    _, store, agent = bundle
+    session = store.resolve(46, 0, 1)
+    sid = session["id"]
+
+    class Console:
+        polls = 0
+
+        def tools(self, session):
+            return [{"type": "function", "function": {"name": "write_stdin", "description": "poll",
+                                                      "parameters": {"type": "object", "properties": {}}}}]
+
+        async def execute(self, session, name, args):
+            self.polls += 1
+            return {"running": self.polls < 4, "output": f"chunk {self.polls}"}
+
+    console = Console()
+    agent.extensions.append(console)
+    poll = {"session_id": "t1", "chars": "", "yield_time_ms": 1000}
+    agent.deepseek = Scripted([call_message("write_stdin", poll, i) for i in range(4)]
+                              + [{"role": "assistant", "content": "тесты прошли"}])
+
+    await agent.run(session, "дождись тестов")
+    agent.note_activity(sid)
+
+    results = [e["payload"]["result"] for e in store.events(sid) if e["kind"] == "tool_result"]
+    assert len(results) == 4 and console.polls == 4
+    assert not any(r.get("loop_guard") for r in results), "four identical polls of one command all ran"
+    assert not any("остановлен защитой" in (e["payload"].get("text") or "")
+                   for e in store.events(sid) if e["kind"] == "notice")
+

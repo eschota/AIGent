@@ -22,8 +22,9 @@ from .selfheal import RESTART_FLAG
 
 RESTART_EXIT_CODE = 3  # any non-zero code makes the supervisor respawn; 3 names the reason in its log
 VERIFY_TEXT = ("Сервер перезапущен на новой ревизии по твоему запросу. Проверь инструментами, что всё "
-               "работает: /healthz и версия, supervisor.json (не было ли отката), нужные тесты. Если всё "
+               "работает: server_status (версия, ревизия, не было ли отката), нужные тесты. Если всё "
                "в порядке — set_goal со status=done; если что-то сломалось — почини или доложи точную ошибку.")
+SUPERVISOR_FIELDS = ("state", "revision", "restarts", "failures", "good_revision", "restored", "exit_code", "updated")
 
 
 class Lifecycle:
@@ -31,6 +32,7 @@ class Lifecycle:
 
     def __init__(self, agent, store, config, exit=os._exit):
         self.agent, self.store, self.config, self.exit = agent, store, config, exit
+        self.started = time.time()
 
     @staticmethod
     def supervised():
@@ -38,14 +40,35 @@ class Lifecycle:
 
     # ------------------------------------------------------------------ extension protocol
     def tools(self, session):
-        return [tool("restart_server",
+        return [tool("server_status",
+                     "The running AIGent server: version, uptime, whether a supervisor runs it, and what the "
+                     "supervisor recorded (state, revision, restarts, a rollback). Use it to verify a restart.",
+                     {}, []),
+                tool("restart_server",
                      "Restart the AIGent server on its current code AFTER this turn ends, so an edit to the "
                      "connector takes effect. Call it only after the tests passed. The turn is never cut: "
                      "finish it with a short report; after the restart you get a message asking you to verify "
-                     "the new revision and close the goal. The supervisor rolls a dead revision back.",
+                     "the new revision (server_status) and close the goal. The supervisor rolls a dead revision back.",
                      {"reason": {"type": "string"}}, ["reason"])]
 
+    def status(self):
+        """Safe facts about the process; nothing from the configuration, no secrets."""
+        from .version import __version__
+        supervisor = None
+        path = self.config.root / "supervisor.json"
+        if path.is_file():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                supervisor = {k: data.get(k) for k in SUPERVISOR_FIELDS if k in data}
+            except (ValueError, OSError):
+                supervisor = {"error": "supervisor.json is unreadable"}
+        return {"version": __version__, "uptime_seconds": round(time.time() - self.started),
+                "supervised": self.supervised(), "supervisor": supervisor,
+                "restart_pending": bool(self.pending())}
+
     async def execute(self, session, name, args):
+        if name == "server_status":
+            return self.status()
         if name != "restart_server":
             raise ValueError("Unknown lifecycle tool")
         sid = session["id"]

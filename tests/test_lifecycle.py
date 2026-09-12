@@ -70,6 +70,24 @@ async def test_the_restart_waits_for_the_turn_and_queues_the_verification(bundle
     assert [n.get("restart") for n in notices if n.get("restart")] == ["scheduled", "now"]
 
 
+async def test_server_status_reports_the_supervisor_without_secrets(bundle, monkeypatch):
+    config, store, agent, lifecycle, _ = bundle
+    monkeypatch.setenv("AIGENT_SUPERVISED", "1")
+    session = store.resolve(5, 0, 1)
+    (config.root / "supervisor.json").write_text(json.dumps({
+        "state": "starting", "revision": "abc", "restarts": 4, "failures": 0, "good_revision": "abb",
+        "secret_looking_field": "must not leak"}), encoding="utf-8")
+
+    status = await agent.execute(session, "server_status", {})
+
+    assert status["supervised"] is True and status["restart_pending"] is False and status["uptime_seconds"] >= 0
+    assert status["supervisor"] == {"state": "starting", "revision": "abc", "restarts": 4, "failures": 0,
+                                    "good_revision": "abb"}
+    assert "secret_looking_field" not in json.dumps(status) and status["version"]
+    await agent.execute(session, "restart_server", {"reason": "x"})
+    assert (await agent.execute(session, "server_status", {}))["restart_pending"] is True
+
+
 async def test_the_self_heal_flag_is_honoured_for_the_finishing_session(bundle, monkeypatch):
     _, store, agent, lifecycle, exits = bundle
     monkeypatch.setenv("AIGENT_SUPERVISED", "1")

@@ -6,17 +6,19 @@ tags: [aigent, youtube, chrome, upload, computer-use, dynivy, studio]
 
 # Publishing a video on the owner's YouTube channel
 
-The owner's Chrome is the tool: `mcp__aigent__chrome_open` relaunches it with a DevTools port on
-their own profile (their Google login included), and the other `chrome_*` tools read and drive the
-tab. YouTube Studio is Polymer: everything sits in shadow DOM, which `chrome_snapshot` walks; act
+AIGent's Chrome window is the tool: `mcp__aigent__chrome_open` starts a visible Chrome on AIGent's
+own profile (the owner's everyday Chrome cannot be driven: Chrome 136+ ignores the DevTools port on
+the default profile), and the other `chrome_*` tools read and drive the tab. The owner signs in to
+Google there once, by hand; the login persists in that profile. YouTube Studio is Polymer: everything sits in shadow DOM, which `chrome_snapshot` walks; act
 through refs from the latest snapshot, and take a new snapshot after every click that changes the
 page.
 
 ## The flow that works
 
-1. `chrome_open` with `https://studio.youtube.com/` and `restart_chrome: true` (Chrome usually runs
-   without the port; it closes and comes back with its tabs). If the page is a Google sign-in, stop
-   and ask the owner to sign in in that window, then `chrome_wait` for `url_contains: studio.youtube`.
+1. `chrome_open` with `https://studio.youtube.com/`. If the result carries `sign_in_required` (a
+   Google sign-in page), tell the owner to sign in in the AIGent Chrome window that just opened and
+   keep calling `chrome_wait` with `url_contains: studio.youtube` (50 s per call) until it passes;
+   never type credentials yourself.
 2. Open the upload dialog: click the **Create** button (aria-label "Create"/"Создать", top right),
    then the menu item **Upload videos** ("Загрузить видео"). Alternative: `chrome_open`
    `https://studio.youtube.com/upload` directly.

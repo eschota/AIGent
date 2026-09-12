@@ -1,11 +1,11 @@
-"""Drive the owner's own Chrome from the agent, over the DevTools protocol.
+"""Drive a Chrome window from the agent, over the DevTools protocol.
 
-The owner asked for a tool that opens *their* browser and does things in it — uploading a reel to
-their YouTube channel being the first. So this is not a headless profile of the connector: it is
-the owner's Chrome, their Default profile, their logins, made scriptable by relaunching it with
-``--remote-debugging-port``. Chrome refuses a second instance on the same profile, so when Chrome
-already runs without the port the tool asks to close and relaunch it (an approval; open tabs are
-restored by Chrome's own session restore).
+The owner asked for a tool that opens a browser and does things in it — uploading a reel to their
+YouTube channel being the first. It is a visible Chrome, not a headless one, but it runs on its
+own profile directory under the data root: Chrome 136+ silently ignores ``--remote-debugging-port``
+on the user's default data directory (a defence against session theft), so the everyday Chrome
+cannot be driven and is never touched. The owner signs in once, by hand, in the window the agent
+opens; that login then persists in the AIGent profile.
 
 No Playwright, no websocket package: the DevTools protocol is JSON over a WebSocket, and the few
 frames this needs fit in a hundred lines below. Pages built from shadow DOM (YouTube Studio is
@@ -14,8 +14,8 @@ elements themselves, and clicks are real mouse events at the element's centre �
 between a button that reacts and one that does not.
 
 Tools: chrome_open, chrome_snapshot, chrome_click, chrome_type, chrome_press, chrome_upload,
-chrome_wait, chrome_screenshot, chrome_eval. Uploads, evaluation and a Chrome relaunch go
-through the session's approval; the owner's Default profile is never copied anywhere.
+chrome_wait, chrome_screenshot, chrome_eval. Uploads, evaluation and the Chrome launch go through
+the session's approval; nothing is ever copied out of the owner's everyday profile.
 """
 
 import asyncio
@@ -261,10 +261,19 @@ class ChromeTools:
         raise ValueError("Chrome was not found; set browser_binary in the settings.")
 
     def user_data_dir(self):
+        """AIGent's own Chrome profile directory.
+
+        Chrome 136+ silently ignores --remote-debugging-port on the user's default data directory
+        (a defence against session theft), so the agent's Chrome lives in its own directory under
+        the data root. The owner signs in there once, in the window the agent opens; nothing is
+        ever copied from their everyday profile.
+        """
         configured = self.config.values.get("chrome_user_data_dir") or ""
         if configured:
             return configured
-        return os.path.join(os.environ.get("LOCALAPPDATA", ""), "Google", "Chrome", "User Data")
+        path = self.config.root / "chrome-automation"
+        path.mkdir(parents=True, exist_ok=True)
+        return str(path)
 
     def profile(self):
         return self.config.values.get("chrome_profile") or "Default"
@@ -272,15 +281,15 @@ class ChromeTools:
     def launch_args(self, url):
         return [self.binary(), f"--remote-debugging-port={self.port()}", "--remote-allow-origins=*",
                 f"--user-data-dir={self.user_data_dir()}", f"--profile-directory={self.profile()}",
-                "--restore-last-session", "--no-first-run", "--new-window", url]
+                "--no-first-run", "--no-default-browser-check", "--new-window", url]
 
     # ------------------------------------------------------------------ extension protocol
     def tools(self, session):
         target = {"ref": {"type": "integer"}, "selector": STRING, "text": STRING}
         return [
-            tool("chrome_open", "Open a URL in the owner's own Chrome (their profile and logins) and make the tab "
-                 "scriptable. If Chrome runs without the DevTools port, restart_chrome=true closes and relaunches it "
-                 "(approval; Chrome restores its tabs). Returns a snapshot of the page.",
+            tool("chrome_open", "Open a URL in AIGent's Chrome window (a separate Chrome profile with its own "
+                 "logins, started on demand; the owner signs in there once, by hand) and make the tab scriptable. "
+                 "Returns a snapshot; sign_in_required in it means: ask the owner to sign in and wait.",
                  {"url": STRING, "restart_chrome": {"type": "boolean"}}, ["url"]),
             tool("chrome_snapshot", "The current tab: url, title, visible text and the interactive elements with refs "
                  "(buttons, links, inputs, menu items — shadow DOM included). Refs are valid until the page changes.",
@@ -297,9 +306,10 @@ class ChromeTools:
                  "it) without an OS dialog. The path is workspace-relative or absolute; approval.",
                  {**target, "path": STRING}, ["path"]),
             tool("chrome_wait", "Wait until the page shows text, a selector matches, or the URL contains a string "
-                 "(any that are given), up to timeout_seconds (default 30, max 600). Returns a snapshot.",
+                 "(any that are given), up to timeout_seconds (default 30, max 50 per call; call again to keep "
+                 "waiting). Returns a snapshot.",
                  {"text": STRING, "selector": STRING, "url_contains": STRING,
-                  "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 600}}, []),
+                  "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 50}}, []),
             tool("chrome_screenshot", "Screenshot of the tab saved into the workspace and shown to you when the model "
                  "can see images.", {}, []),
             tool("chrome_eval", "Evaluate a JavaScript expression in the page and return its JSON value; approval.",
@@ -346,40 +356,21 @@ class ChromeTools:
         except httpx.HTTPError:
             return False
 
-    @staticmethod
-    def chrome_running():
-        if os.name != "nt":
-            return False
-        out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq chrome.exe", "/NH"], capture_output=True, text=True)
-        return "chrome.exe" in out.stdout
-
-    async def ensure_chrome(self, session, url, restart):
+    async def ensure_chrome(self, session, url, restart=False):
+        """AIGent's Chrome instance, started on demand; the owner's everyday Chrome is never touched."""
         if await self.alive():
             return {"launched": False}
-        if self.chrome_running():
-            if not restart:
-                raise ValueError("Chrome уже запущен без порта отладки. Повторите chrome_open с restart_chrome=true: "
-                                 "Chrome закроется и запустится заново с вашим профилем и портом отладки "
-                                 "(открытые вкладки Chrome восстановит сам).")
-            if not await self.agent.approve(session, "chrome_open · перезапуск Chrome",
-                                            "Закрыть Chrome и запустить его заново с портом отладки на профиле "
-                                            f"{self.profile()}: {' '.join(self.launch_args(url))}", admin_only=True):
-                return {"denied": True}
-            subprocess.run(["taskkill", "/IM", "chrome.exe"], capture_output=True)
-            for _ in range(20):
-                await asyncio.sleep(0.5)
-                if not self.chrome_running():
-                    break
-            else:
-                subprocess.run(["taskkill", "/IM", "chrome.exe", "/F"], capture_output=True)
-                await asyncio.sleep(1)
+        if not await self.agent.approve(session, "chrome_open · запуск Chrome AIGent",
+                                        "Запустить отдельный Chrome AIGent (свой профиль, порт отладки): "
+                                        + " ".join(self.launch_args(url)), admin_only=True):
+            return {"denied": True}
         subprocess.Popen(self.launch_args(url), creationflags=getattr(subprocess, "DETACHED_PROCESS", 0)
                          | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0), close_fds=True)
-        for _ in range(60):
+        for _ in range(50):
             await asyncio.sleep(0.5)
             if await self.alive():
                 return {"launched": True}
-        raise ValueError("Chrome не поднял порт отладки за 30 секунд.")
+        raise ValueError("Chrome не поднял порт отладки за 25 секунд; проверьте browser_binary и chrome_user_data_dir.")
 
     async def targets(self):
         response = await self.client.get(f"http://127.0.0.1:{self.port()}/json", timeout=5)
@@ -427,9 +418,12 @@ class ChromeTools:
                     socket = await self.attach(sid, None, url)
             if not state["launched"]:
                 await socket.call("Page.navigate", {"url": url})
-            await self.settle(socket)
+            await self.settle(socket, seconds=10)
             snapshot = await self.snapshot(socket)
             snapshot["launched_chrome"] = state["launched"]
+            if "accounts.google.com" in str(snapshot.get("url") or "") or "ServiceLogin" in str(snapshot.get("url") or ""):
+                snapshot["sign_in_required"] = ("Это отдельный Chrome AIGent: владелец должен один раз войти в Google "
+                                                "в этом окне сам. Попроси его войти и жди chrome_wait по url_contains.")
             return snapshot
 
     # ------------------------------------------------------------------ page operations
@@ -530,7 +524,7 @@ class ChromeTools:
         return {"uploaded": str(path), "bytes": path.stat().st_size, "next": "chrome_wait for the page to react"}
 
     async def wait(self, socket, args):
-        timeout = max(1, min(600, int(args.get("timeout_seconds") or 30)))
+        timeout = max(1, min(50, int(args.get("timeout_seconds") or 30)))  # the MCP client gives a call one minute
         text, selector, url_part = args.get("text"), args.get("selector"), args.get("url_contains")
         deadline = time.monotonic() + timeout
         while True:

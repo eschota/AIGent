@@ -184,6 +184,7 @@ async def test_the_session_patch_offers_aigent_tools_over_mcp_and_disables_telem
     assert f"http://127.0.0.1:8787/api/mcp/{sid}" in text and config["connector_token"] in text
     assert "serverName: aigent" in text and "transport: streamable-http" in text
     assert "mode: DISABLED" in text and ".claude/skills" in text
+    assert "personaPrefix" in text and "по-русски" in text, "the language rule lives in the system prompt persona"
     assert FakeHarness.instances[0].options["patches"] == (str(patch),)
     instructions = (engine.home() / "AGENTS.md").read_text(encoding="utf-8")
     assert "mcp__aigent__restart_server" in instructions and "Infer the goal and do the work" in instructions

@@ -202,10 +202,19 @@ async def test_a_message_queued_mid_turn_is_forwarded_into_the_running_turn(bund
             return [event(dsh_session, "agent/inbox/spliced", {"inserted": [{"id": mid}]}),
                     Note("session.status", {"sessionId": dsh_session, "status": "running"}),
                     event(dsh_session, "step/start", {"turn": 1, "step": 1})]
+        # Harness splices the forwarded prompt for the NEXT turn: the running turn ends first with
+        # its own answer, then a follow-on turn starts at once and answers the owner's message.
         return [event(dsh_session, "assistant/message", {"turn": 1, "step": 2, "message": {"role": "assistant", "content": [
-                    {"type": "text", "text": "Учёл: " + blocks[0]["text"]}]}}),
+                    {"type": "text", "text": "Первый ход закончен."}]}}),
                 event(dsh_session, "step/end", {"turn": 1, "step": 2}),
                 event(dsh_session, "turn/end", {"turn": 1, "reason": {"kind": "completed"}}),
+                Note("session.status", {"sessionId": dsh_session, "status": "idle"}),
+                Note("session.status", {"sessionId": dsh_session, "status": "running"}),
+                event(dsh_session, "turn/start", {"turn": 2}),
+                event(dsh_session, "assistant/message", {"turn": 2, "step": 1, "message": {"role": "assistant", "content": [
+                    {"type": "text", "text": "Учёл: " + blocks[0]["text"]}]}}),
+                event(dsh_session, "step/end", {"turn": 2, "step": 1}),
+                event(dsh_session, "turn/end", {"turn": 2, "reason": {"kind": "completed"}}),
                 Note("session.status", {"sessionId": dsh_session, "status": "idle"})]
 
     FakeHarness.script = staticmethod(script)
@@ -219,7 +228,9 @@ async def test_a_message_queued_mid_turn_is_forwarded_into_the_running_turn(bund
     events = [(e["kind"], e["payload"]) for e in store.events(sid)]
     assert any(k == "user" and p.get("inline") and p["text"] == "и ещё добавь тест" for k, p in events)
     assert any(k == "queue_started" and p.get("inline") for k, p in events)
-    assert "Учёл: и ещё добавь тест" in agent.telegram.text.await_args_list[0].args[1]
+    assert "Учёл: и ещё добавь тест" in agent.telegram.text.await_args_list[0].args[1], \
+        "the follow-on turn that answers the forwarded message is followed as part of the owner's turn"
+    assert any(k == "notice" and "после завершения текущего хода" in (p.get("text") or "") for k, p in events)
 
 
 # 4 ---------------------------------------------------------------------------------

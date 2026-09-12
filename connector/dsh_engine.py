@@ -288,13 +288,18 @@ class DshEngine:
             runtime.prompts += 1
             mapper.message_id = message_id
             polls = 0
-            while not mapper.finished:
+            while True:
                 subscription.drain(mapper.handle)
                 if mapper.finished:
+                    # A prompt forwarded mid-turn starts a follow-on turn the moment this one ends:
+                    # keep listening briefly so that turn is followed as part of the owner's turn.
+                    if mapper.forwarded and await self.follow_on(subscription, mapper):
+                        continue
                     break
                 polls += 1
                 if polls % QUEUE_EVERY == 0:
-                    await self.forward_queued(session, runtime, subscription)
+                    if await self.forward_queued(session, runtime, subscription):
+                        mapper.forwarded += 1
                 await asyncio.sleep(POLL_SECONDS)
             text = mapper.final_answer()
             if text:
@@ -316,6 +321,17 @@ class DshEngine:
             except Exception:
                 pass
 
+    async def follow_on(self, subscription, mapper, seconds=4.0):
+        """True when the runtime starts another turn right away (a queued prompt); the mapper resumes."""
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            subscription.drain(mapper.handle)
+            if not mapper.finished:
+                mapper.forwarded = max(0, mapper.forwarded - 1)
+                return True
+            await asyncio.sleep(POLL_SECONDS)
+        return False
+
     async def forward_queued(self, session, runtime, subscription):
         """An owner message sent mid-turn goes into the running turn instead of waiting behind it."""
         sid = session["id"]
@@ -328,8 +344,11 @@ class DshEngine:
                                 notification_subscription=subscription)
         self.store.event(sid, "user", {"text": self.agent.plain_text(content), "inline": True})
         self.store.event(sid, "queue_started", {"id": item["id"], "auto": False, "inline": True})
-        self.store.event(sid, "notice", {"text": "Сообщение владельца получено посреди хода — передано движку, "
-                                                 "не прерывая работу.", "absorbed": 1})
+        # Harness 0.1.5 splices an SDK prompt for the NEXT turn, never into the running one: the
+        # model reads it the moment the current turn ends, and the engine keeps following that turn.
+        self.store.event(sid, "notice", {"text": "Сообщение владельца передано движку: он прочитает его сразу после "
+                                                 "завершения текущего хода и продолжит, не прерывая работу.",
+                                         "absorbed": 1})
         self.agent.auto_pending.discard(sid)
         return True
 
@@ -344,6 +363,7 @@ class TurnMapper:
         self.message_id = None
         self.received = False
         self.finished = False
+        self.forwarded = 0        # owner prompts forwarded mid-turn, each starting a follow-on turn
         self.final_text = ""
         self.pending_text = ""
         self.calls = {}          # callId -> display name
@@ -354,9 +374,12 @@ class TurnMapper:
     def handle(self, note):
         method, payload = note.method, note.payload
         if method == "session.status":
-            if payload.get("sessionId") == self.runtime.dsh_session and self.received \
-                    and payload.get("status") == "idle":
-                self.finish()
+            if payload.get("sessionId") == self.runtime.dsh_session and self.received:
+                if payload.get("status") == "idle":
+                    self.finish()
+                elif payload.get("status") == "running" and self.finished:
+                    self.finished = False  # the follow-on turn for a forwarded prompt
+                    self.final_text, self.pending_text = "", ""
             return
         if method == "subagent.started":
             self.child_started(payload)

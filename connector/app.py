@@ -879,7 +879,8 @@ def create_app(root: Path | None = None, polling=True):
             if account["provider"] == "deepseek":
                 status = {"connected": bool(config["deepseek_key"] if account["id"] == "deepseek-default" else config["account_keys"].get(account["id"])),
                           "source": "DeepSeek API", "checked_at": time.time(),
-                          "models": [{"id": "deepseek-flash"}, {"id": "deepseek-v4-pro"}]}
+                          "models": [{"id": "deepseek-flash", "displayName": "DeepSeek V4.1 Flash"},
+                                     {"id": "deepseek-v4-pro", "displayName": "DeepSeek V4 Pro"}]}
             else:
                 status = await local.status(account, refresh)
             return {k: v for k, v in account.items() if k != "metadata"} | {"status": status}

@@ -501,7 +501,8 @@ def create_app(root: Path | None = None, polling=True):
     @app.get("/api/status", dependencies=[Depends(require_admin)])
     async def status():
         return {"bot": bot.status, "username": bot.username, "error": bot.last_error,
-                "ui_revision": ui_revision(), "supervisor": supervisor_state(),
+                "version": __version__, "revision": ui_revision(), "ui_revision": ui_revision(),
+                "supervisor": supervisor_state(),
                 "started": app.state.started, "restarted": getattr(app.state, "restarted", None),
                 "usage": store.usage(), "sessions": len(store.sessions()),
                 "running": len(agent.jobs), "model": config["model"]}

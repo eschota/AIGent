@@ -457,6 +457,8 @@ async function refresh() {
   $('bot-status').classList.toggle('error', status.bot === 'error');
   $('bot-status').title = status.error || '';
   setText('model-label', status.model); setText('session-count', sessions.length);
+  const versionLabel = $('version-label');
+  if (versionLabel) { setText('version-label', `v${status.version||''}`); versionLabel.title = `Сборка ${status.revision||'—'} · обновляется автоматически`; }
   if(status.supervisor?.state==='rolled_back'&&status.supervisor.restored!==lastRollback){
     lastRollback=status.supervisor.restored;
     toast('Сервер откатился на последнюю рабочую версию кода ('+lastRollback+') после неудачной правки.');

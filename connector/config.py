@@ -63,6 +63,9 @@ class Config:
             "allow_web": True, "web_search_url": "https://html.duckduckgo.com/html/?q={query}",
             "web_allow_private": False, "browser_binary": "", "browser_timeout_seconds": 60,
             "project_map_budget_usd": 0.50,
+            # Periodic SQLite cleanup of transient rows (stream events, sent/cancelled queued
+            # messages, closed async questions) older than the retention window.
+            "cleanup_days": 14, "cleanup_interval_hours": 6,
             # Gravity House server graphics record the 3D viewer takes its quality presets from.
             "graphics_preset_url": "https://autorig.online/gravityhouse/api/graphics",
             "connector_token": secrets.token_urlsafe(32),

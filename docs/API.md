@@ -53,8 +53,13 @@ for chunk in client.chat.completions.create(
 | GET | `/api/sessions/{id}/usage` | Per-request accounting and session totals |
 | GET | `/api/balance` | Shared DeepSeek API account balance |
 | GET | `/api/status` | Poller state, model, aggregate usage |
+| POST | `/api/maintenance/cleanup` | Run transient-row cleanup immediately: body `{"days": int?}` (omitted → config `cleanup_days`); returns per-category delete counts and whether VACUUM ran |
 
 Upload fields: `file`, `kind` (document/photo/audio/voice/video/video_note/animation/sticker), `caption`, `send_telegram` and `ask_agent`. Delivery always targets the selected session, never a caller-supplied chat ID. A web-only session has no Telegram destination. Any binary format can be stored as a document, subject to size limits.
+
+## Maintenance
+
+A background task removes transient rows so the journal does not grow forever. Every `cleanup_interval_hours` (default 6) it deletes `stream` events, sent/cancelled `queued_messages` and closed `async_questions` older than `cleanup_days` (default 14); the first run is 60 s after startup. A VACUUM runs only when more than 1000 rows were removed. The job logs via `print` and writes no session events. `POST /api/maintenance/cleanup` runs it on demand.
 
 ## Self-healing
 

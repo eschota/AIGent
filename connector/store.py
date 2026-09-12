@@ -293,3 +293,21 @@ class Store:
         totals["cache_hit_percent"] = (100 * totals["cache_hit_tokens"] / totals["prompt_tokens"]
                                         if totals["prompt_tokens"] else 0)
         return totals
+
+    def cleanup(self, days=14):
+        """Delete transient rows older than `days`; vacuum only after a large sweep."""
+        cutoff = time.time() - float(days) * 86400
+        deleted_stream = self.db.execute(
+            "DELETE FROM events WHERE kind='stream' AND created < ?", (cutoff,)).rowcount
+        deleted_queued = self.db.execute(
+            "DELETE FROM queued_messages WHERE status IN ('sent','cancelled') AND created < ?",
+            (cutoff,)).rowcount
+        deleted_questions = self.db.execute(
+            "DELETE FROM async_questions WHERE status != 'open' AND created < ?", (cutoff,)).rowcount
+        self.db.commit()
+        total = deleted_stream + deleted_queued + deleted_questions
+        vacuum = total > 1000
+        if vacuum:
+            self.db.execute("VACUUM")
+        return {"stream_events": deleted_stream, "queued_messages": deleted_queued,
+                "async_questions": deleted_questions, "total": total, "vacuum": vacuum}

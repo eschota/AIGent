@@ -101,6 +101,10 @@ class SessionBody(BaseModel):
     project_id: str | None = None
 
 
+class CleanupBody(BaseModel):
+    days: int | None = None
+
+
 class AccountBody(BaseModel):
     provider: str
     name: str = Field(min_length=1, max_length=120)
@@ -306,11 +310,27 @@ def create_app(root: Path | None = None, polling=True):
         for session in store.sessions():
             if store.queued(session["id"]):
                 agent.drain(session["id"])
+
+        async def cleanup_loop():
+            await asyncio.sleep(60)
+            while True:
+                try:
+                    result = await asyncio.to_thread(store.cleanup, config["cleanup_days"])
+                    print(f"[cleanup] {result}")
+                except Exception as exc:
+                    print(f"[cleanup] failed: {exc}")
+                await asyncio.sleep(float(config["cleanup_interval_hours"]) * 3600)
+
+        app.state.cleanup_task = asyncio.create_task(cleanup_loop())
         yield
         task = getattr(app.state, "sync_task", None)
         if task:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+        cleanup_task = getattr(app.state, "cleanup_task", None)
+        if cleanup_task:
+            cleanup_task.cancel()
+            await asyncio.gather(cleanup_task, return_exceptions=True)
         await sync.close()
         await shared.close()
         await subagents.close()
@@ -506,6 +526,11 @@ def create_app(root: Path | None = None, polling=True):
                 "started": app.state.started, "restarted": getattr(app.state, "restarted", None),
                 "usage": store.usage(), "sessions": len(store.sessions()),
                 "running": len(agent.jobs), "model": config["model"]}
+
+    @app.post("/api/maintenance/cleanup", dependencies=[Depends(require_admin)])
+    async def cleanup_now(body: CleanupBody):
+        days = body.days if body.days is not None else config["cleanup_days"]
+        return await asyncio.to_thread(store.cleanup, days)
 
     @app.get("/api/update", dependencies=[Depends(require_admin)])
     async def update_status(force: bool = False):

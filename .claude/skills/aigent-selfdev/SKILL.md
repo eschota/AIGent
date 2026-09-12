@@ -46,6 +46,14 @@ offers a one-click reload when it notices newer files).
 - A turn that ends with the goal still active continues itself after a short grace window;
   any owner activity cancels that continuation and resets the budget.
 
+## Housekeeping
+
+- A helper script you write for one step goes to `.tmp/` (ignored by git) and is deleted after;
+  nothing scratch lands in the project root or in a commit.
+- Commit only the files the task changed; run `git status --short` before `git add`.
+- Stale beliefs from earlier in the conversation (a file you once saw broken) are re-checked
+  with a read before acting on them.
+
 ## Boundaries that hold
 
 - `.local`, `.git`, `.env`, `.codex`, `.claude` are outside the tools' reach: read the server's

@@ -61,7 +61,10 @@ STRING = {"type": "string"}
 TOOLS = [
     tool("view_image", "See a workspace image, screenshots or 3D previews. Use region to read tiny text from a large screenshot. Crop coordinates are relative to the source; computer actions still use the full screenshot coordinates.", {"path": STRING, "detail": {"type": "string", "enum": ["original", "low"]}, "region": {"type": "object", "properties": {"x": {"type": "integer", "minimum": 0}, "y": {"type": "integer", "minimum": 0}, "width": {"type": "integer", "minimum": 1}, "height": {"type": "integer", "minimum": 1}}, "required": ["x", "y", "width", "height"], "additionalProperties": False}}, ["path"]),
     tool("list_files", "List files in a relative workspace directory.", {"path": STRING}, ["path"]),
-    tool("read_file", "Read a UTF-8 text file, at most 40000 characters.", {"path": STRING}, ["path"]),
+    tool("read_file", "Read a UTF-8 text file, at most 40000 characters. For a large file pass start "
+         "(1-based line) and lines (at most 400) to read one range; the result reports the total line count.",
+         {"path": STRING, "start": {"type": "integer", "minimum": 1},
+          "lines": {"type": "integer", "minimum": 1, "maximum": 400}}, ["path"]),
     tool("search_files", "Literal text search in workspace text files.", {"query": STRING}, ["query"]),
     tool("write_file", "Propose a complete UTF-8 file; user approves exact diff before writing.",
          {"path": STRING, "content": STRING}, ["path", "content"]),
@@ -1489,17 +1492,31 @@ class Agent:
                                if not p.is_symlink() and p.name not in {".local", ".git", ".venv", "node_modules", ".aigent", ".codex", ".claude", "__pycache__"}][:300]}
         if name == "read_file":
             path = safe_path(root, args["path"])
-            if path.stat().st_size > 200000:
-                raise ValueError("File too large; maximum text file size is 200 KB.")
-            data = path.read_text(encoding="utf-8")[:40000]
+            ranged = bool(args.get("start") or args.get("lines"))
+            if path.stat().st_size > (5_000_000 if ranged else 200000):
+                raise ValueError("File too large; maximum text file size is 200 KB, or 5 MB when reading a "
+                                 "range with start and lines.")
+            whole = path.read_text(encoding="utf-8")
+            key, extra = args["path"], {}
+            if ranged:
+                start = max(1, int(args.get("start") or 1))
+                count = max(1, min(400, int(args.get("lines") or 200)))
+                rows = whole.splitlines()
+                chunk = rows[start - 1:start - 1 + count]
+                data = "\n".join(chunk)[:40000]
+                key = f"{args['path']}#{start}+{count}"
+                extra = {"range": [start, start + len(chunk) - 1] if chunk else [start, start - 1],
+                         "total_lines": len(rows)}
+            else:
+                data = whole[:40000]
             digest = hashlib.sha256(data.encode()).hexdigest()
             cache = self.read_cache.setdefault(conversation, {})
-            if cache.get(args["path"]) == digest:
+            if cache.get(key) == digest:
                 self.store.event(sid, "read_cache", {"path": args["path"], "avoided_chars": len(data)})
-                return {"unchanged": True, "path": args["path"], "sha256": digest,
+                return {"unchanged": True, "path": args["path"], "sha256": digest, **extra,
                         "note": "Use the previously returned content in this conversation."}
-            cache[args["path"]] = digest
-            return {"path": args["path"], "text": data, "sha256": digest, "limit_chars": 40000}
+            cache[key] = digest
+            return {"path": args["path"], "text": data, "sha256": digest, "limit_chars": 40000, **extra}
         if name == "search_files":
             query, found, count = args["query"], [], 0
             if not query:

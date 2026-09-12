@@ -1062,3 +1062,25 @@ async def test_a_blind_model_gets_images_described_by_the_vision_sidecar(bundle)
     assert len(sidecar.calls) == 1, "described once: the same picture is sent again every step and turn"
     assert len(backend.calls) == 2 and not contains_images(backend.calls[1][0])
 
+
+async def test_read_file_reads_a_line_range_of_a_big_file_and_caches_per_range(bundle):
+    _, store, agent = bundle
+    session = store.resolve(45, 0, 1)
+    sid = session["id"]
+    big = "\n".join(f"line {i}" for i in range(1, 30001))  # ~ 350 KB: over the whole-file limit
+    (agent.workspace(sid) / "big.txt").write_text(big, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="200 KB"):
+        await agent.execute(session, "read_file", {"path": "big.txt"})
+
+    part = await agent.execute(session, "read_file", {"path": "big.txt", "start": 500, "lines": 3})
+    assert part["text"] == "line 500\nline 501\nline 502"
+    assert part["range"] == [500, 502] and part["total_lines"] == 30000
+
+    again = await agent.execute(session, "read_file", {"path": "big.txt", "start": 500, "lines": 3})
+    assert again.get("unchanged") is True and again["range"] == [500, 502]
+    other = await agent.execute(session, "read_file", {"path": "big.txt", "start": 29999, "lines": 400})
+    assert other["text"] == "line 29999\nline 30000" and other["range"] == [29999, 30000]
+    beyond = await agent.execute(session, "read_file", {"path": "big.txt", "start": 40000, "lines": 5})
+    assert beyond["text"] == "" and beyond["range"] == [40000, 39999], "an empty range is honest, not an error"
+

@@ -634,7 +634,9 @@ function renderEvent(event) {
     set_goal:'🎯',ask_user_async:'❓',update_plan:'🗒️'};
   if (kind === 'user') startActivity('Обдумывает задачу','','🧠');
   if (kind === 'tool') startActivity(toolNames[p.name]||p.name||'Инструмент',
-      String(p.arguments?.path||p.arguments?.cmd||p.arguments?.query||p.arguments?.prompt||''), TOOL_ICONS[p.name]||'⚙️');
+      String(p.arguments?.path||p.arguments?.cmd||p.arguments?.query||p.arguments?.prompt||'')
+        + (p.step ? ' · шаг '+p.step+'/'+(p.ceiling ?? '—') : ''),
+      TOOL_ICONS[p.name]||'⚙️');
   if (kind === 'tool_result') startActivity('Работает','','⚙️');
   if (kind === 'stream') startActivity(activity.label||'Пишет ответ','','✍️');
   if (kind === 'approval') startActivity('Ждёт подтверждения',String(p.name||''),'⏸️');

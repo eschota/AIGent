@@ -558,6 +558,22 @@ async def test_path_escape_error_explains_the_expected_path(bundle):
     assert "relative path with forward slashes" in result["hint"]
 
 
+async def test_tool_event_reports_the_step_and_ceiling_of_the_turn(bundle):
+    _, store, agent = bundle
+    session = store.resolve(43, 0, 1)
+    sid = session["id"]
+    (agent.workspace(sid) / "a.txt").write_text("content", encoding="utf-8")
+    agent.deepseek = Scripted([call_message("read_file", {"path": "a.txt"}, 0),
+                               call_message("list_files", {"path": "."}, 1),
+                               {"role": "assistant", "content": "готово"}])
+
+    await agent.run(session, "поработай")
+
+    tools = [e["payload"] for e in store.events(sid) if e["kind"] == "tool"]
+    assert tools[0]["step"] == 1 and tools[0]["ceiling"] == 200
+    assert tools[1]["step"] == 2
+
+
 async def test_a_checkpoint_never_ends_a_turn_that_works_toward_its_goal(bundle):
     config, store, agent = bundle
     config.values["max_steps"] = 2

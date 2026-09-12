@@ -1194,7 +1194,8 @@ class Agent:
                                 self.store.event(sid, "notice", {"text": f"Повтор одного и того же вызова {name} "
                                                                          "остановлен защитой от цикла."})
                             else:
-                                self.store.event(sid, "tool", {"name": name, "arguments": args, "call_id": call["id"]})
+                                self.store.event(sid, "tool", {"name": name, "arguments": args, "call_id": call["id"],
+                                                               "step": step, "ceiling": ceiling})
                                 started = time.monotonic()
                                 result = await self.execute(session, name, args)
                                 waited = time.monotonic() - started

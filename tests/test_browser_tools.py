@@ -9,8 +9,8 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
-from connector.agent import Agent
 from connector import browser_tools
+from connector.agent import Agent
 from connector.browser_tools import BrowserTools, html_to_text, parse_results
 from connector.config import Config
 from connector.store import Store
@@ -61,6 +61,18 @@ def build(agent, handler):
 
     tools.resolve_host = resolve
     return tools
+
+
+def hide_browsers(monkeypatch, agent):
+    """Make the locator find nothing, whatever the host actually has installed.
+
+    Without this a Windows box with Edge in its default location (or any machine with an
+    AIGENT_BROWSER override) still offers browser_open and the "hidden" assertions fail.
+    """
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    monkeypatch.setattr(browser_tools, "WINDOWS_BROWSERS", [])
+    monkeypatch.delenv("AIGENT_BROWSER", raising=False)
+    agent.config.values["browser_binary"] = ""
 
 
 def events(agent, sid, kind):
@@ -207,10 +219,7 @@ async def test_unparsable_search_page_explains_itself(agent, session):
 # ---------------------------------------------------------------- tool offering
 
 def test_tools_hidden_without_a_browser_or_when_web_is_off(agent, session, monkeypatch):
-    monkeypatch.setattr(shutil, "which", lambda name: None)
-    # A browser installed on the host would otherwise be discovered through the platform fallback.
-    monkeypatch.setattr(browser_tools, "WINDOWS_BROWSERS", ())
-    monkeypatch.delenv("AIGENT_BROWSER", raising=False)
+    hide_browsers(monkeypatch, agent)
     tools = BrowserTools(agent, AsyncMock())
     assert [t["function"]["name"] for t in tools.tools(session)] == ["web_fetch", "web_search"]
     agent.config.values["browser_binary"] = fake_browser(agent.config.root)

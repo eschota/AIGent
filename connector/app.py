@@ -30,6 +30,7 @@ from .computer import ComputerTools
 from .skill_manager import SkillIndex
 from .project_map import ProjectMap
 from .shared_tools import SharedTools
+from .video_tools import VideoTools
 from .ssh_tools import SSHTools
 from .browser_tools import BrowserTools
 from .media import MediaService, MediaUnavailable, UnsupportedMedia
@@ -239,6 +240,8 @@ def create_app(root: Path | None = None, polling=True):
     agent.project_map = project_map
     shared = SharedTools(agent, client, skills)
     agent.extensions.append(shared)
+    video = VideoTools(agent, media)
+    agent.extensions.append(video)
     bot = Bot(config, store, telegram, agent)
     sync = SessionSync(config, store, telegram, agent)
     agent.sync = sync

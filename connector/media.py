@@ -222,6 +222,78 @@ class MediaService:
         temp.replace(target)
         return target
 
+    async def keyframes(self, file: Path, count: int = 6, width: int = 640) -> list[Path]:
+        """Representative frames of a video: scene changes when they exist, even spacing otherwise.
+
+        Frames are cached next to the other derived files, so asking twice costs one extraction.
+        """
+        program = self.tool("ffmpeg")
+        if not program:
+            raise MediaUnavailable("ffmpeg is required to read frames out of a video")
+        count = max(1, min(12, int(count)))
+        folder = self.folder_for(file) / f"keyframes-{count}-{width}"
+        existing = sorted(folder.glob("frame-*.jpg"))
+        if existing:
+            return existing
+        folder.mkdir(parents=True, exist_ok=True)
+        pattern = str(folder / "frame-%02d.jpg")
+        # No -vsync/-fps_mode here: image2 output writes one file per selected frame, and the
+        # flag was renamed in ffmpeg 7, so leaving it out keeps every build working.
+        scene = ["-vf", f"select='gt(scene,0.25)',scale={width}:-2",
+                 "-frames:v", str(count), "-q:v", "4", pattern]
+        try:
+            await self.run(program, ["-hide_banner", "-loglevel", "error", "-i", str(file), *scene, "-y"])
+        except MediaUnavailable:
+            # A smooth clip has no scene cuts at all: ffmpeg writes nothing and exits non-zero.
+            pass
+        frames = sorted(folder.glob("frame-*.jpg"))
+        if len(frames) >= min(3, count):
+            return frames[:count]
+        # A steady shot has no scene cuts: fall back to evenly spaced samples.
+        for frame in frames:
+            frame.unlink(missing_ok=True)
+        seconds = self.duration(await self.probe(file)) or 0
+        rate = f"{count}/{max(seconds, 1):.3f}" if seconds else "1"
+        await self.run(program, ["-hide_banner", "-loglevel", "error", "-i", str(file),
+                                 "-vf", f"fps={rate},scale={width}:-2", "-frames:v", str(count),
+                                 "-q:v", "4", pattern, "-y"])
+        return sorted(folder.glob("frame-*.jpg"))[:count]
+
+    def folder_for(self, file: Path) -> Path:
+        """Cache directory shared by every derivative of one source file."""
+        digest = hashlib.sha256(f"{file}:{file.stat().st_mtime_ns}:{file.stat().st_size}".encode()).hexdigest()[:16]
+        folder = Path(self.config.root) / "media-cache" / "keyframes" / digest
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder
+
+    @staticmethod
+    def quality(data: dict) -> dict:
+        """Plain technical facts plus a blunt verdict, so nobody calls a 384x224 clip cinematic."""
+        streams = data.get("streams") or []
+        video = next((s for s in streams if s.get("codec_type") == "video"), {})
+        audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
+        width, height = int(video.get("width") or 0), int(video.get("height") or 0)
+        rate = video.get("avg_frame_rate") or "0/1"
+        try:
+            numerator, _, denominator = rate.partition("/")
+            fps = round(float(numerator) / float(denominator or 1), 2)
+        except (ValueError, ZeroDivisionError):
+            fps = 0.0
+        bitrate = int((data.get("format") or {}).get("bit_rate") or video.get("bit_rate") or 0)
+        pixels = max(1, width * height)
+        notes = []
+        if height and height < 480:
+            notes.append("below SD: acceptable as a draft, not as a deliverable")
+        if fps and fps < 20:
+            notes.append(f"{fps} fps looks choppy in motion")
+        if bitrate and bitrate / pixels < 0.35:
+            notes.append("low bitrate for this resolution; expect blocking on motion")
+        if audio is None:
+            notes.append("no audio track")
+        return {"width": width, "height": height, "fps": fps, "codec": video.get("codec_name"),
+                "bitrate": bitrate, "pixel_format": video.get("pix_fmt"), "audio": bool(audio),
+                "verdict": "; ".join(notes) or "no obvious technical problems"}
+
     @staticmethod
     def duration(data: dict) -> float:
         try:

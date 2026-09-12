@@ -145,9 +145,9 @@ class SharedTools:
         except (ValueError, ProviderError, OSError) as exc:
             self.forget(sid)
             self.agent.store.event(sid, "error", {"text": "Ферма: " + self.agent.config.redact(exc)})
-        except asyncio.CancelledError:
-            self.agent.store.event(sid, "notice", {"text": "Ожидание фермы прервано; задача на ферме не отменена."})
-            raise
+        # A cancelled wait is left to propagate without a notice: cancellation happens on every
+        # graceful shutdown/restart (the farm task keeps running and resume() picks it up again),
+        # so logging "прервано" here fired on every restart cycle and spammed the event log.
 
     async def produce(self, session, kind, prompt, path="", work_flow="", frames=0, size=""):
         sid = session["id"]
@@ -275,17 +275,23 @@ class SharedTools:
         return result
 
     async def poll(self, sid, job):
-        """Wait for a farm task inside the tool. A shell command must never poll for this."""
-        deadline, last = time.monotonic() + TIMEOUTS.get(job["kind"], 1800), None
+        """Wait for a farm task inside the tool. A shell command must never poll for this.
+
+        The poll ticks every POLL_SECONDS for the whole render (20+ minutes), so a per-tick notice
+        floods the event log, the context and the Telegram mirror. Only a genuinely new stage is
+        announced — each distinct stage once (submitted → rendering → done/failed) — and the
+        repeated same-stage ticks in between are silent.
+        """
+        deadline, seen = time.monotonic() + TIMEOUTS.get(job["kind"], 1800), set()
         while time.monotonic() < deadline:
             rows = await self.request("GET", "/renderfin/api-render-get-task-by-url",
                                       params={"url": job["output_url"]})
             row = rows[0] if rows else {}
             stage = str(row.get("status", "pending")).lower()
-            if stage != last:
+            if stage not in seen:
                 self.agent.store.event(sid, "notice", {"text": f"Ферма · {job['kind']} · {stage}",
                                                        "task_id": job["task_id"]})
-                last = stage
+                seen.add(stage)
             if stage in {"error", "failed", "discarded"}:
                 detail = str(row.get("error") or row.get("error_string") or stage)[:400]
                 raise ProviderError(f"задача {job['task_id']} отклонена ({row.get('workflow', '')}): {detail}")
@@ -341,7 +347,9 @@ class SharedTools:
             if not session or session.get("deleted") or time.time() - job.get("started", 0) > TIMEOUTS.get(job["kind"], 1800):
                 self.forget(sid)
                 continue
-            self.agent.store.event(sid, "notice", {"text": f"Ферма · продолжаю ждать задачу {job['task_id']}"})
+            # No per-task "продолжаю ждать" notice: resume runs on every startup, so over a restart
+            # loop during one long render it paired with the cancel notice into dozens of events.
+            # poll() re-announces the real stage; the render itself is never restarted here.
             self.spawn(session, job["kind"], self.finish(session, job))
             resumed.append(job["task_id"])
         return resumed

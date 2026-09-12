@@ -25,7 +25,7 @@ for(const [text,action] of [['Файлы',()=>showDock('editor')],['Git',()=>sho
 document.querySelector('.topbar').insertBefore(headerActions,$('header-settings'));
 const projectSection=el('div',undefined,'projects-section');
 projectSection.innerHTML='<div class="sidebar-label">Проекты <button id="open-project" title="Открыть проект">＋</button></div><div id="project-list"></div>';
-$('sessions').previousElementSibling.before(projectSection);
+($('chats-label')||$('sessions').previousElementSibling).before(projectSection);
 const accountsButton=el('button','Аккаунты и лимиты','accounts-button');accountsButton.id='accounts-button';$('settings-button').before(accountsButton);
 const archiveButton=el('button','Архив чатов');archiveButton.id='show-archive';$('settings-button').before(archiveButton);
 const trashButton=el('button','Корзина');trashButton.id='show-trash';$('settings-button').before(trashButton);
@@ -90,7 +90,21 @@ function renderAccounts(){
     if(a.provider!=='deepseek'){if(a.provider==='codex'){const login=el('button',a.status.connected?'Проверить вход':'Войти через браузер');login.onclick=handle(()=>loginAccount(a));actions.append(login);}else{const link=el('a','Штатный вход в Claude CLI ↗');link.href='https://code.claude.com/docs/en/authentication';link.target='_blank';link.rel='noreferrer';actions.append(link);}const history=el('button','Локальные чаты');history.onclick=handle(()=>nativeHistory(a));actions.append(history);}
     const chat=el('button','Новый чат');chat.onclick=()=>{$('accounts-dialog').close();showNewChat(a.id);};actions.append(chat);row.append(actions);return row;
   }));
-  document.querySelectorAll('.sidebar .provider').forEach((row,index)=>{const kind=['deepseek','codex','claude'][index];const found=accountsData.filter(a=>a.provider===kind);const small=row.querySelector('small');if(small)small.textContent=`${found.filter(a=>a.status.connected).length} из ${found.length} подключены`;row.classList.remove('future');row.role='button';row.tabIndex=0;row.onclick=()=>showAccounts();});
+  const list=$('providers-list');
+  if(list){
+    let connectedTotal=0;
+    list.replaceChildren(...[['deepseek','D','DeepSeek','API'],['codex','C','Codex',''],['claude','C','Claude','']].map(([kind,mark,name,tag])=>{
+      const found=accountsData.filter(a=>a.provider===kind);
+      const connected=found.filter(a=>a.status.connected).length;connectedTotal+=connected;
+      const row=el('button',undefined,'provider'+(connected?'':' future'));row.type='button';
+      row.append(el('span',mark,'provider-icon'));
+      const body=el('div');body.append(el('span',name),el('small',`${connected} из ${found.length} подключены`));row.append(body);
+      if(tag)row.append(el('span',tag,'tag'));
+      row.onclick=()=>{$('providers-popover').hidden=true;$('providers-toggle')?.setAttribute('aria-expanded','false');showAccounts();};
+      return row;
+    }));
+    const count=$('providers-count');if(count)count.textContent=connectedTotal?String(connectedTotal):'';
+  }
 }
 async function showAccounts(){await refreshConnections();$('accounts-dialog').showModal();}
 async function loginAccount(account){

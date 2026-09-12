@@ -184,6 +184,115 @@ def test_turn_note_is_pure_and_bounded():
     assert turn_note("2026-09-11", None).count("No goal is recorded yet") == 1
 
 
+# --- tool-call adjacency (the DeepSeek HTTP 400 crash) ------------------------------
+def _assistant_call(cid, name="shared_video"):
+    return {"role": "assistant", "content": None,
+            "tool_calls": [{"id": cid, "type": "function", "function": {"name": name, "arguments": "{}"}}]}
+
+
+def test_context_enforces_tool_call_adjacency_after_an_interleaved_message(bundle):
+    """The live crash: a farm reply returns after the owner wrote mid-turn, so the tool message no
+    longer immediately follows its assistant tool_calls turn and DeepSeek rejects it with HTTP 400."""
+    _, store, agent = bundle
+    sid = store.resolve(60, 0, 1)["id"]
+    store.message(sid, {"role": "user", "content": "сделай ролик"})
+    store.message(sid, _assistant_call("X"))
+    store.message(sid, {"role": "tool", "tool_call_id": "X", "content": '{"pending": true}'})
+    # The owner writes mid-turn; then the slow farm tool returns a late SECOND reply for the same id.
+    store.message(sid, {"role": "user", "content": "поменяй сцену"})
+    store.message(sid, {"role": "tool", "tool_call_id": "X", "content": '{"path": "shared/clip.mp4"}'})
+
+    messages = agent.context(sid)
+
+    assert agent.well_formed(messages), "context() must emit a list DeepSeek would accept"
+    tools = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
+    assert len(tools) == 1, "the late duplicate reply is dropped, never sent as an orphan"
+    owner = messages[tools[0] - 1]
+    assert owner.get("tool_calls") and owner["tool_calls"][0]["id"] == "X", "the reply follows its own turn"
+    assert any(m.get("content") == "поменяй сцену" for m in messages), "the mid-turn message survives, after the block"
+
+
+def test_well_formed_flags_a_split_turn_and_sanitize_repairs_it(bundle):
+    _, _, agent = bundle
+    split = [_assistant_call("Y", "read_file"),
+             {"role": "user", "content": "mid-turn"},
+             {"role": "tool", "tool_call_id": "Y", "content": "ok"}]
+    assert agent.well_formed(split) is False, "a user message between the turn and its reply is malformed"
+
+    fixed = agent.sanitize(split)
+    assert agent.well_formed(fixed)
+    assert [m["role"] for m in fixed] == ["assistant", "tool", "user"], "the reply is pulled back beside its turn"
+    assert fixed[1]["content"] == "ok", "the real reply is kept, not replaced by a synthetic one"
+
+
+def test_sanitize_drops_orphans_and_synthesizes_missing_replies(bundle):
+    _, _, agent = bundle
+    history = [{"role": "tool", "tool_call_id": "gone", "content": "orphan"},
+               {"role": "user", "content": "hi"},
+               _assistant_call("Z", "read_file")]
+
+    result = agent.sanitize(history)
+
+    assert agent.well_formed(result)
+    assert not any(m.get("tool_call_id") == "gone" for m in result), "a pure orphan is dropped"
+    synth = [m for m in result if m.get("tool_call_id") == "Z"][0]
+    assert json.loads(synth["content"])["interrupted"] is True, "an unanswered turn gets a synthetic reply"
+
+
+def test_repair_history_records_a_note_instead_of_orphaning_a_buried_turn(bundle):
+    """A tool_calls turn that already has a later message after it must never get a bare tool
+    reply appended: the store only appends, so that reply would land out of place and orphan."""
+    _, store, agent = bundle
+    sid = store.resolve(61, 0, 1)["id"]
+    store.message(sid, _assistant_call("W"))
+    store.message(sid, {"role": "user", "content": "next thing"})  # a later turn already appended
+
+    agent.repair_history(sid)
+
+    history = store.history(sid)
+    assert not any(m.get("role") == "tool" for m in history), "no bare tool message after the interleaved user turn"
+    assert history[-1]["role"] == "user" and "фоновой задачи" in history[-1]["content"]
+    assert agent.well_formed(agent.sanitize(history)), "the outgoing view is still well-formed"
+
+
+async def test_a_mid_turn_message_queues_and_never_abandons_a_running_farm_job(bundle):
+    """BUG 3: an interleaved owner message steers the next turn; it must not cancel a farm render
+    already in flight nor discard its finished result."""
+    from connector.shared_tools import SharedTools
+
+    _, store, agent = bundle
+    session = store.resolve(62, 0, 1)
+    sid = session["id"]
+    shared = SharedTools(agent, AsyncMock())
+    agent.extensions.append(shared)
+
+    release = asyncio.Event()
+
+    async def farm_job():
+        await release.wait()
+        return {"path": "shared/clip.mp4"}
+
+    shared.spawn(session, "video", farm_job())
+
+    async def turn():  # an agent turn is in progress, so the new message is interleaved
+        await release.wait()
+
+    agent.jobs[sid] = asyncio.create_task(turn())
+    await asyncio.sleep(0)
+    assert agent.busy(sid) and shared.running(sid)
+
+    result = agent.submit(session, "и добавь звук")
+    assert result["accepted"] and result["queued"] and result["position"] == 1
+    assert shared.running(sid), "the interleaved message must not cancel the farm task"
+
+    release.set()
+    await agent.jobs.pop(sid)
+    await asyncio.sleep(0.01)
+    assert not shared.running(sid)
+    results = [e for e in store.events(sid) if e["kind"] == "tool_result"]
+    assert results and results[-1]["payload"]["result"]["path"] == "shared/clip.mp4", "finished work reached the chat"
+
+
 # --- context compaction -------------------------------------------------------------
 def fill(store, sid, results, size=4000, task="task"):
     store.message(sid, {"role": "user", "content": task})

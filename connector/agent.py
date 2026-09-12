@@ -225,13 +225,28 @@ class Agent:
         await self.telegram.text(session, text)
 
     def repair_history(self, sid):
+        """Close tool_calls left unanswered by an interrupted turn, without ever orphaning one.
+
+        The store only appends, so a synthetic tool reply is safe only when its assistant turn
+        is still at the tail of history — nothing but its own tool replies may follow it. If a
+        later message (a user turn started meanwhile, an interleaved note) already sits after the
+        turn, a bare tool message would land out of place and DeepSeek would reject the request;
+        the loss is recorded as a user-role note instead, which can never break tool adjacency.
+        """
         history = self.store.history(sid)
-        answered = {m.get("tool_call_id") for m in history if m["role"] == "tool"}
-        for message in history:
-            for call in message.get("tool_calls", []):
-                if call["id"] not in answered:
-                    self.store.message(sid, {"role": "tool", "tool_call_id": call["id"],
+        answered = {m.get("tool_call_id") for m in history if m.get("role") == "tool"}
+        for index, message in enumerate(history):
+            unanswered = [call["id"] for call in (message.get("tool_calls") or []) if call["id"] not in answered]
+            if not unanswered:
+                continue
+            if all(m.get("role") == "tool" for m in history[index + 1:]):
+                for cid in unanswered:
+                    self.store.message(sid, {"role": "tool", "tool_call_id": cid,
                                              "content": "Interrupted before completion; inspect state before retrying."})
+            else:
+                self.store.message(sid, {"role": "user", "content":
+                    "Результат фоновой задачи не получен: ход был прерван до ответа инструмента. "
+                    "Проверь фактическое состояние прежде чем повторять шаг."})
 
     async def complete_with_retry(self, backend, sid, tools, delta, attempts=3):
         """Transient provider faults must not end a turn; permanent ones are reported once."""
@@ -247,15 +262,67 @@ class Agent:
 
     @staticmethod
     def sanitize(history):
-        """Drop tool results whose call is gone: the API rejects an unmatched tool message."""
-        known, result = set(), []
+        """Return history with strict tool-call adjacency, the ordering DeepSeek enforces.
+
+        DeepSeek does not merely require a tool result's call id to be known somewhere earlier:
+        every ``role:"tool"`` message must sit in an unbroken run immediately after the assistant
+        message whose ``tool_calls`` contain its id (only sibling tool replies of the same turn may
+        sit between). A user message inserted mid-turn, or a farm reply that returns after later
+        messages were appended, breaks that run and the request is rejected with HTTP 400.
+
+        Each assistant tool_calls turn is rebuilt with exactly one reply per call id placed right
+        after it: the stored reply when one exists, otherwise a synthetic "interrupted" reply.
+        Tool messages that no assistant turn owns — pure orphans, and duplicate/late replies whose
+        id was already answered — are dropped. The result is always well_formed().
+        """
+        replies = {}
         for message in history:
-            if message.get("role") == "tool" and message.get("tool_call_id") not in known:
-                continue
-            for call in message.get("tool_calls") or []:
-                known.add(call.get("id"))
-            result.append(message)
+            if message.get("role") == "tool":
+                cid = message.get("tool_call_id")
+                if cid is not None and cid not in replies:
+                    replies[cid] = message  # the first, in-order reply for a call id wins
+        result, used = [], set()
+        for message in history:
+            role = message.get("role")
+            if role == "tool":
+                continue  # re-emitted below, inside the assistant turn that owns it
+            calls = message.get("tool_calls") or []
+            if role == "assistant" and calls:
+                result.append(message)
+                for call in calls:
+                    cid = call.get("id")
+                    reply = replies.get(cid)
+                    if reply is not None and cid not in used:
+                        result.append(reply)
+                    else:
+                        result.append({"role": "tool", "tool_call_id": cid, "content": json.dumps(
+                            {"interrupted": True,
+                             "note": "reply lost to an interleaved message; state may have advanced"},
+                            ensure_ascii=False)})
+                    used.add(cid)
+            else:
+                result.append(message)
         return result
+
+    @staticmethod
+    def well_formed(messages):
+        """Every tool message sits in an unbroken run right after the assistant turn it answers.
+
+        This is the invariant DeepSeek requires of the outgoing list: no orphan tool message and
+        no assistant tool_calls turn split from (or missing) its replies.
+        """
+        pending = set()
+        for message in messages:
+            if message.get("role") == "tool":
+                cid = message.get("tool_call_id")
+                if cid not in pending:
+                    return False
+                pending.discard(cid)
+            else:
+                if pending:  # a non-tool message before all replies of the open turn arrived
+                    return False
+                pending = {call.get("id") for call in (message.get("tool_calls") or [])}
+        return not pending
 
     @staticmethod
     def text_size(messages):
@@ -507,8 +574,14 @@ class Agent:
         memory = self.map_context(sid)
         if memory:
             guidance = guidance + "\n" + memory + "\n"
-        return ([{"role": "system", "content": prompt}, {"role": "user", "content": guidance}] + history
-                + [{"role": "user", "content": self.turn_note(sid)}])
+        messages = ([{"role": "system", "content": prompt}, {"role": "user", "content": guidance}] + history
+                    + [{"role": "user", "content": self.turn_note(sid)}])
+        # Guarantee tool-call adjacency across the whole outgoing list: sanitize is idempotent, so a
+        # well-formed history is returned byte-for-byte (the DeepSeek prefix cache is preserved) and a
+        # malformed one — a late farm reply after an interleaved message — can never reach the API.
+        messages = self.sanitize(messages)
+        assert self.well_formed(messages), "outgoing messages violate tool-call adjacency"
+        return messages
 
     # ------------------------------------------------------------------ goal of the session
     def blank_goal(self, sid):

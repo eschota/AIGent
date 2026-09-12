@@ -10,6 +10,7 @@ $('usage-panel').append(document.querySelector('.inspector'));
 document.querySelector('.composer-footer').append($('stop-button'));
 $('stop-button').hidden=true;
 let attachments=[], projectIndex={}, uiRevision='', uiReloadOffered=false, lastRollback='';
+let chatSort='date';try{chatSort=localStorage.getItem('aigent.chatSort')||'date';}catch{}
 const attachStrip=el('div',undefined,'composer-attachments');attachStrip.id='composer-attachments';attachStrip.hidden=true;$('message').before(attachStrip);
 const queueStrip=el('div',undefined,'queued-messages');queueStrip.id='queued-messages';queueStrip.hidden=true;$('composer').before(queueStrip);
 const goalBanner=el('div',undefined,'goal-banner');goalBanner.id='goal-banner';goalBanner.hidden=true;$('composer').before(goalBanner);
@@ -268,6 +269,50 @@ function richText(target, text) {
   }
   flush();if(code)target.append(el('pre',code.join('\n'),'code-block'));
 }
+function chatCost(u){
+  if(!u||u.cost_usd==null)return '—';
+  const c=Number(u.cost_usd);
+  if(!(c>0))return '$0';
+  if(c<0.01)return '<$0.01';
+  return '$'+c.toFixed(2);
+}
+function chatCostTitle(u){
+  if(!u)return '';
+  return `${fmt(u.requests)} запросов · вход ${fmt(u.prompt_tokens)} · выход ${fmt(u.completion_tokens)} · кеш ${fmt(u.cache_hit_tokens)}`
+    +(u.cost_usd!=null?` · ${money(u.cost_usd)}`:'');
+}
+function sortSessions(list){
+  const arr=[...list];
+  const pin=(a,b)=>(b.pinned?1:0)-(a.pinned?1:0);
+  if(chatSort==='cost')arr.sort((a,b)=>pin(a,b)||(Number(b.usage?.cost_usd)||0)-(Number(a.usage?.cost_usd)||0));
+  else arr.sort((a,b)=>pin(a,b)||(Number(b.created)||0)-(Number(a.created)||0));
+  return arr;
+}
+function renderSessions(){
+  const ordered=sortSessions(allSessions);
+  const nextSignature=JSON.stringify([current?.id,chatSort,ordered.map(s=>[s.id,s.title,s.status,s.pinned?1:0,s.usage?.cost_usd])]);
+  if(nextSignature===sessionSignature)return;
+  sessionSignature=nextSignature;
+  $('sessions').replaceChildren(...ordered.map(s => {
+    const button = el('button', undefined, 'session-item' + (current?.id === s.id ? ' selected' : ''));
+    button.dataset.sessionId=s.id;
+    const head=el('div',undefined,'session-item-head');
+    head.append(el('span', s.title, 'session-title-text'));
+    const cost=el('span', chatCost(s.usage), 'session-cost-badge');cost.title=chatCostTitle(s.usage);
+    head.append(cost);
+    button.append(head, el('small', `${s.chat_id ? 'Telegram' : 'Web / API'} · ${s.status}`));
+    button.onclick = handle(() => selectSession(s)); return button;
+  }));
+}
+function renderTotalSpend(u){
+  const node=$('total-spend');
+  if(!node)return;
+  node.textContent='Σ '+(u.cost_usd==null?'—':'$'+Number(u.cost_usd).toFixed(2));
+  const names={deepseek:'DeepSeek',codex:'Codex',claude:'Claude'},byProvider={};
+  for(const s of allSessions){const p=s.provider||'deepseek';byProvider[p]=(byProvider[p]||0)+(Number(s.usage?.cost_usd)||0);}
+  const parts=Object.entries(byProvider).filter(([,v])=>v>0).map(([k,v])=>`${names[k]||k}: $${v.toFixed(2)}`);
+  node.title='Суммарный расход всех сессий'+(parts.length?'\n'+parts.join('\n'):'');
+}
 async function refresh() {
   const [status, sessions, approvals] = await Promise.all([api('/api/status'), api('/api/sessions'), api('/api/approvals')]);
   allSessions = sessions;
@@ -293,17 +338,10 @@ async function refresh() {
   setText('cache-tokens', fmt(u.cache_hit_tokens) + ' токенов' + (u.unknown_cache_requests ? ' · данные неполные' : ''));
   setText('total-cost', money(u.cost_usd) + (u.unpriced_requests ? ' + ?' : ''));
   setText('total-saved', 'Экономия ' + money(u.saved_usd));
-  if (status.username) {
-    $('telegram-link').href = 'https://t.me/' + status.username;
-    $('group-link').href = 'https://t.me/' + status.username + '?startgroup=aigent&admin=manage_topics';
-  }
-  const nextSignature=JSON.stringify([current?.id,sessions.map(s=>[s.id,s.title,s.status])]);
-  if(nextSignature!==sessionSignature){sessionSignature=nextSignature;$('sessions').replaceChildren(...sessions.map(s => {
-    const button = el('button', undefined, 'session-item' + (current?.id === s.id ? ' selected' : ''));
-    button.dataset.sessionId=s.id;
-    button.append(el('span', s.title), el('small', `${s.chat_id ? 'Telegram' : 'Web / API'} · ${s.status}`));
-    button.onclick = handle(() => selectSession(s)); return button;
-  }));}
+  renderTotalSpend(u);
+  const tg=$('telegram-link');
+  if (status.username && tg) tg.href = 'https://t.me/' + status.username;
+  renderSessions();
   const selected = sessions.find(s => s.id === current?.id);
   if (selected) {current = selected; updateSessionStats(selected.usage);}
   const busy = selected && ['running','approval'].includes(selected.status);
@@ -775,6 +813,22 @@ $('settings-button').onclick=handle(showSettings);
 $('header-settings').onclick=handle(showSettings);
 $('composer-model').onclick=handle(showSettings);
 $('toggle-sidebar').onclick=()=>document.body.classList.toggle('sidebar-collapsed');
+document.querySelectorAll('#chat-sort button').forEach(b=>{
+  b.classList.toggle('active',b.dataset.sort===chatSort);
+  b.onclick=()=>{chatSort=b.dataset.sort;try{localStorage.setItem('aigent.chatSort',chatSort);}catch{}
+    document.querySelectorAll('#chat-sort button').forEach(x=>x.classList.toggle('active',x===b));
+    sessionSignature='';renderSessions();};
+});
+{
+  const toggle=$('providers-toggle'),popover=$('providers-popover');
+  if(toggle&&popover){
+    const place=()=>{const r=toggle.getBoundingClientRect();popover.style.left=Math.max(8,Math.min(r.left,innerWidth-266))+'px';popover.style.top=(r.bottom+6)+'px';};
+    const close=()=>{popover.hidden=true;toggle.setAttribute('aria-expanded','false');};
+    toggle.onclick=e=>{e.stopPropagation();const show=popover.hidden;popover.hidden=!show;toggle.setAttribute('aria-expanded',String(show));if(show)place();};
+    document.addEventListener('pointerdown',e=>{if(!popover.hidden&&!popover.contains(e.target)&&!toggle.contains(e.target))close();});
+    document.addEventListener('keydown',e=>{if(e.key==='Escape')close();});
+  }
+}
 $('attach-button').onclick=()=>$('composer-file-picker').click();
 $('close-settings').onclick=()=>{if(!setupToken)$('settings-dialog').close();};
 $('settings-dialog').addEventListener('cancel',e=>{if(setupToken)e.preventDefault();});

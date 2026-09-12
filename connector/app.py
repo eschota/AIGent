@@ -537,6 +537,7 @@ def create_app(root: Path | None = None, polling=True):
         return {"bot": bot.status, "username": bot.username, "error": bot.last_error,
                 "version": __version__, "revision": ui_revision(), "ui_revision": ui_revision(),
                 "supervisor": supervisor_state(), "engine": config.values.get("engine", "dsh") if engine.enabled() else "legacy",
+                "engine_runtimes": engine.status()["runtimes"],
                 "started": app.state.started, "restarted": getattr(app.state, "restarted", None),
                 "usage": store.usage(), "sessions": len(store.sessions()),
                 "running": len(agent.jobs), "model": config["model"]}

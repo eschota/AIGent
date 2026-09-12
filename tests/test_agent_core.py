@@ -106,10 +106,23 @@ def test_prompt_carries_environment_budget_and_guidance(config_bundle):
     text = build_system_prompt({}, TOOLS, config_bundle, "/tmp/project", NOW, "Project guidance from AGENTS.md")
     assert "2026-09-11" not in text, "the date is volatile: it belongs to the turn note, not the cached prefix"
     assert "/tmp/project" in text
-    assert f"Step budget for this turn: {config_bundle['max_steps']}" in text
-    assert "queued and processed after it" in text
+    assert f"Every {config_bundle['max_steps']} model calls is a checkpoint" in text
+    assert "the ceiling is 200 calls per turn" in text and "Step budget for this turn" not in text
+    assert "delivered to you at the next step" in text
     assert "Project guidance from AGENTS.md" in text
     assert SYSTEM.splitlines()[0] in text
+
+
+def test_prompt_budget_and_delegation_follow_the_session(config_bundle):
+    off = build_system_prompt({"auto_continue": 0}, TOOLS, config_bundle, "/tmp/project")
+    assert f"Step budget for this turn: {config_bundle['max_steps']}" in off and "checkpoint" not in off
+    spawn = [{"type": "function", "function": {"name": "spawn_subagents", "description": "Delegate."}}]
+    plain = build_system_prompt({}, TOOLS, config_bundle, "/tmp/project")
+    assert "## Delegation" not in plain, "never describe a tool that is absent"
+    delegating = build_system_prompt({}, TOOLS + spawn, config_bundle, "/tmp/project")
+    assert "## Delegation" in delegating and "Delegate by default" in delegating
+    config_bundle.values["max_turn_steps"] = 300
+    assert "the ceiling is 300 calls per turn" in build_system_prompt({}, TOOLS, config_bundle, "/tmp/project")
 
 
 def test_prompt_without_tools(config_bundle):
@@ -545,11 +558,40 @@ async def test_path_escape_error_explains_the_expected_path(bundle):
     assert "relative path with forward slashes" in result["hint"]
 
 
-async def test_exhausted_step_budget_ends_with_a_summary(bundle):
+async def test_a_checkpoint_never_ends_a_turn_that_works_toward_its_goal(bundle):
     config, store, agent = bundle
     config.values["max_steps"] = 2
     session = store.resolve(39, 0, 1)
     sid = session["id"]
+    (agent.workspace(sid) / "a.txt").write_text("content", encoding="utf-8")
+    backend = Scripted([call_message("read_file", {"path": "a.txt"}, 0),
+                        call_message("list_files", {"path": "."}, 1),
+                        call_message("search_files", {"query": "content"}, 2),
+                        {"role": "assistant", "content": "Сделано: a.txt прочитан, поиск выполнен."}])
+    agent.deepseek = backend
+
+    await agent.run(session, "поработай")
+    agent.note_activity(sid)  # the goal is still open: drop the continuation this test is not about
+
+    assert len(backend.calls) == 4, "the turn passed the checkpoint and finished on its own"
+    assert all(tools for _, tools in backend.calls), "no toolless summary call was needed"
+    assert not any(str(m.get("content", "")).startswith("Step budget for this turn is exhausted")
+                   for messages, _ in backend.calls for m in messages)
+    notices = [e["payload"] for e in store.events(sid) if e["kind"] == "notice"]
+    passed = [n for n in notices if n.get("checkpoint")]
+    # Passed once, at two completed calls; the fourth call finished the turn before another was due.
+    assert [n["checkpoint"] for n in passed] == [2] and passed[0]["ceiling"] == 200
+    assert "продолжаю без остановки" in passed[0]["text"] and "цель активна" in passed[0]["text"]
+    assert not any("имит шагов" in (n.get("text") or "") for n in notices)
+    assert any("Сделано" in e["payload"]["text"] for e in store.events(sid) if e["kind"] == "assistant")
+
+
+async def test_with_auto_continue_off_the_checkpoint_ends_the_turn_with_a_summary(bundle):
+    config, store, agent = bundle
+    config.values["max_steps"] = 2
+    session = store.resolve(40, 0, 1)
+    sid = session["id"]
+    store.update_session(sid, auto_continue=0)
     (agent.workspace(sid) / "a.txt").write_text("content", encoding="utf-8")
     backend = Scripted([call_message("read_file", {"path": "a.txt"}, 0),
                         call_message("list_files", {"path": "."}, 1),
@@ -563,8 +605,63 @@ async def test_exhausted_step_budget_ends_with_a_summary(bundle):
     assert backend.calls[-1][0][-1]["content"].startswith("Step budget for this turn is exhausted")
     texts = [e["payload"]["text"] for e in store.events(sid) if e["kind"] in ("assistant", "notice")]
     assert any("Осталось" in t for t in texts)
-    # The goal is still active, so the turn says it continues instead of asking for a nudge.
-    assert any("имит шагов" in t for t in texts)
+    assert any("Достигнут лимит шагов агента" in t for t in texts), "this owner asked to stop at the limit"
+
+
+async def test_the_ceiling_ends_a_runaway_turn_with_a_summary_and_a_later_continuation(bundle):
+    config, store, agent = bundle
+    config.values["max_steps"] = 2
+    config.values["max_turn_steps"] = 3
+    session = store.resolve(41, 0, 1)
+    sid = session["id"]
+    (agent.workspace(sid) / "a.txt").write_text("content", encoding="utf-8")
+    backend = Scripted([call_message("read_file", {"path": "a.txt"}, 0),
+                        call_message("list_files", {"path": "."}, 1),
+                        call_message("search_files", {"query": "content"}, 2),
+                        {"role": "assistant", "content": "Сводка: три шага сделаны, осталось проверить."}])
+    agent.deepseek = backend
+
+    await agent.run(session, "поработай")
+    agent.note_activity(sid)  # cancel the scheduled continuation; it is asserted, not run
+
+    assert len(backend.calls) == 4 and backend.calls[-1][1] == []
+    assert backend.calls[-1][0][-1]["content"].startswith("Step budget for this turn is exhausted")
+    notices = [e["payload"] for e in store.events(sid) if e["kind"] == "notice"]
+    assert any(n.get("checkpoint") == 2 for n in notices), "the checkpoint before the ceiling was passed"
+    assert any("потолок 3 шагов" in (n.get("text") or "") for n in notices)
+    assert any("Продолжу сам через" in (n.get("text") or "") for n in notices), "the goal continues later"
+
+
+async def test_a_message_sent_mid_turn_joins_the_running_turn_instead_of_waiting(bundle):
+    _, store, agent = bundle
+    session = store.resolve(42, 0, 1)
+    sid = session["id"]
+    (agent.workspace(sid) / "a.txt").write_text("content", encoding="utf-8")
+
+    class Hooked(Scripted):
+        async def complete(self, messages, tools, delta):
+            if not self.calls:  # the owner writes while the first step is in flight
+                store.queue_message(sid, "и ещё добавь тест")
+            return await super().complete(messages, tools, delta)
+
+    backend = Hooked([call_message("read_file", {"path": "a.txt"}, 0),
+                      {"role": "assistant", "content": "Готово, тест добавлю следом."}])
+    agent.deepseek = backend
+
+    await agent.run(session, "поработай")
+    agent.note_activity(sid)
+
+    second = backend.calls[1][0]
+    assert any(m.get("role") == "user" and m.get("content") == "и ещё добавь тест" for m in second), \
+        "the owner's message reached the model at the very next step"
+    assert store.queued(sid) == [], "nothing waits behind the turn"
+    events = [(e["kind"], e["payload"]) for e in store.events(sid)]
+    assert any(k == "queue_started" and p.get("inline") for k, p in events)
+    assert any(k == "user" and p.get("inline") and p["text"] == "и ещё добавь тест" for k, p in events)
+    assert any(k == "notice" and p.get("absorbed") == 1 for k, p in events)
+    history = store.history(sid)
+    after_tool = history[[m["role"] for m in history].index("tool") + 1]
+    assert after_tool == {"role": "user", "content": "и ещё добавь тест"}, "it sits right after the tool result"
 
 
 # --- the goal, and how the agent keeps pursuing it ----------------------------------

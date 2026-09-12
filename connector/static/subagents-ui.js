@@ -6,6 +6,9 @@
 (function () {
   const CAP = 16;                 // keep at most this many chips, trimming finished ones first
   const LIVE = new Set(['queued', 'running']);
+  const TOOL_ICONS = {read_file:'📖',list_files:'📂',search_files:'🔎',write_file:'✏️',apply_patch:'✏️',
+    exec_command:'⌨️',run_command:'⌨️',write_stdin:'⌨️'};
+  const tail = (s) => s.length > 28 ? '…' + s.slice(-27) : s;
   let sid = null;                 // the session the panel currently reflects
   const items = new Map();        // id -> record, insertion order preserved
   let selected = null, timer = null;
@@ -79,9 +82,10 @@
     const count = liveCount();
     const tokens = list.reduce((s, r) => s + (r.tokens || 0), 0);
     const cost = list.reduce((s, r) => s + (r.cost_usd || 0), 0);
+    const steps = list.reduce((s, r) => s + (r.steps || 0), 0);
     dot.style.visibility = count ? 'visible' : 'hidden';
     totalText.textContent = count ? count + ' ' + plural(count, ['субагент', 'субагента', 'субагентов']) : 'Субагенты';
-    totalSum.textContent = `Σ ${fmt(tokens)} токенов · Σ ${money(cost)}`;
+    totalSum.textContent = `${steps} ш. · Σ ${fmt(tokens)} т. · Σ ${money(cost)}`;
     cancel.hidden = count === 0;
 
     chips.replaceChildren();
@@ -94,7 +98,9 @@
       chip.append(el('span', rec.goal || rec.id, 'sa-goal'));
       const clock = LIVE.has(rec.status) && rec.startMs
         ? seconds((Date.now() - rec.startMs) / 1000) : seconds(rec.seconds);
-      const meta = el('span', `${clock} · ${fmt(rec.context_tokens || 0)} т. · ${money(rec.cost_usd || 0)}`, 'sa-meta');
+      const doing = LIVE.has(rec.status) && rec.activity
+        ? ` · ${TOOL_ICONS[rec.activity] || '⚙️'} ${rec.activity}${rec.detail ? ' ' + tail(rec.detail) : ''}` : '';
+      const meta = el('span', `${clock} · ${rec.steps || 0} ш.${doing} · ${money(rec.cost_usd || 0)}`, 'sa-meta');
       chip.append(meta);
       chip.title = (rec.goal || '') + ' · ' + statusLabel(rec.status);
       chip.onclick = () => { selected = selected === rec.id ? null : rec.id; renderDetail(); };
@@ -110,23 +116,18 @@
     if (!rec) return;
     detail.replaceChildren();
     detail.append(el('h4', (rec.emoji || '') + ' ' + (rec.goal || rec.id)));
-    const bits = [statusLabel(rec.status)];
-    if (rec.kind) bits.push('тип: ' + rec.kind);
-    if (rec.score != null) bits.push('оценка ' + rec.score);
-    bits.push(fmt(rec.tokens || 0) + ' токенов');
-    bits.push('контекст ' + fmt(rec.context_tokens || 0) + ' т.');
-    bits.push(money(rec.cost_usd || 0));
-    bits.push(seconds(rec.seconds));
+    const bits = [statusLabel(rec.status), (rec.steps || 0) + ' шагов', fmt(rec.tokens || 0) + ' токенов',
+      'контекст ' + fmt(Math.round((rec.context_chars || 0) / 4)) + ' т.', money(rec.cost_usd || 0), seconds(rec.seconds)];
     detail.append(el('p', bits.join(' · '), 'muted'));
-    if (rec.path) detail.append(el('p', 'Предложен файл: ' + rec.path));
-    if (rec.summary) detail.append(el('pre', rec.summary));
+    if (rec.files && rec.files.length) detail.append(el('p', '✏️ ' + rec.files.join(', ')));
+    if (rec.log && rec.log.length) detail.append(el('pre', rec.log.join('\n'), 'sa-log'));
+    if (rec.report) detail.append(el('pre', rec.report));
     if (rec.error) detail.append(el('p', rec.error, 'muted'));
     if (LIVE.has(rec.status)) detail.append(el('p', 'Выполняется…', 'muted'));
-    else if (!rec.error) detail.append(el('p', 'Это предложение; изменение применяется через обычную проверку.', 'muted'));
   }
 
   function statusLabel(status) {
-    return { queued: 'в очереди', running: 'выполняется', done: 'готово',
+    return { queued: 'в очереди', running: 'выполняется', done: 'готово', exhausted: 'бюджет исчерпан',
              failed: 'ошибка', cancelled: 'отменён' }[status] || status;
   }
   function plural(n, forms) {

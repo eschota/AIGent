@@ -1,4 +1,4 @@
-/* Code subagents: a compact live panel of the current fan-out. Collapses to nothing when idle. */
+/* Coding workers: a compact live panel of the current fan-out. Collapses to nothing when idle. */
 #subagents-panel {
   position: relative;
   margin: 0 0 8px;
@@ -62,6 +62,7 @@
 }
 .sa-chip:hover { background: #16232c; }
 .sa-chip.done { opacity: .68; }
+.sa-chip.exhausted { border-color: #f5c451; }
 .sa-chip.failed { border-color: #f0685f; }
 .sa-chip.cancelled { opacity: .5; }
 .sa-chip .sa-emoji { font-size: 14px; line-height: 1; }
@@ -97,3 +98,4 @@
   word-break: break-word;
 }
 .sa-detail .muted { color: #7f95a2; }
+.sa-detail .sa-log { color: #8aa0ad; max-height: 120px; }

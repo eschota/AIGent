@@ -9,7 +9,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from .prompting import CORE, build_system_prompt, canonical_call
+from .prompting import CORE, TURN_CEILING, build_system_prompt, canonical_call
 from .prompting import turn_note as build_turn_note
 from .providers import DeepSeek, ProviderError, usage_text
 
@@ -21,6 +21,9 @@ COMPACT_MIN_CHARS = 1500
 COMPACT_SUMMARY_CHARS = 300
 SUMMARY_REQUEST = ("Step budget for this turn is exhausted. Summarize briefly: what was done, "
                    "what was verified, what remains, and what the user should do to continue.")
+# `max_steps` is a checkpoint, not an end: a turn that is working toward an active goal passes it
+# without stopping. Only the ceiling ends a turn mid-goal, and it is sized so that a real task
+# never meets it — the loop guard and the owner's stop button handle a runaway turn long before.
 # A tool that waited this long really worked; it is not a loop even if the call repeats.
 LONG_TOOL_SECONDS = 60
 AUTO_CONTINUE = "Continue toward the goal; do not repeat completed steps."
@@ -125,6 +128,19 @@ class Agent:
         task = self.jobs.get(sid)
         return bool(task and not task.done())
 
+    @staticmethod
+    def conversation(session):
+        """Key of the conversation a tool result lands in: the session, or a worker's own thread.
+
+        A worker spawned by the main agent shares the session — workspace, approvals, events — but
+        not the conversation, so an "unchanged" read must never point at content another thread saw.
+        """
+        return session.get("conversation") or session["id"]
+
+    def turn_ceiling(self):
+        """Model calls one turn may spend before it must stop and summarize; the owner can raise it."""
+        return max(int(self.config["max_steps"]), int(self.config.values.get("max_turn_steps", TURN_CEILING)))
+
     def start(self, session, content, auto=False):
         sid = session["id"]
         if self.busy(sid):
@@ -184,6 +200,46 @@ class Agent:
         position = len(pending) + 1
         self.store.event(sid, "queued", {"id": qid, "position": position, "text": self.plain_text(content)})
         return {"accepted": True, "queued": True, "position": position, "queue_id": qid}
+
+    def absorb_queued(self, session):
+        """Owner messages queued during the turn join the conversation at the next step boundary.
+
+        Nothing is interrupted: the tool that was running has returned, so the model reads the new
+        message together with the results it waited for and steers the current work by it. Only
+        owner text can be waiting here — a continuation is never queued while its turn still runs.
+        """
+        sid = session["id"]
+        absorbed = 0
+        while True:
+            item = self.store.take_queued(sid)
+            if not item:
+                break
+            content = item["payload"]
+            self.store.message(sid, {"role": "user", "content": content})
+            self.store.event(sid, "user", {"text": self.plain_text(content), "inline": True})
+            self.store.event(sid, "queue_started", {"id": item["id"], "auto": False, "inline": True})
+            absorbed += 1
+        if absorbed:
+            self.auto_pending.discard(sid)
+            self.store.event(sid, "notice", {"text": "Сообщение владельца получено посреди хода — учитываю его, "
+                                                     "не прерывая работу.", "absorbed": absorbed})
+        return absorbed
+
+    def checkpoint(self, session, step, ceiling):
+        """Every `max_steps` model calls is a checkpoint the turn passes, not a limit it dies at.
+
+        The turn keeps going while the session continues itself; the owner sees the count and the
+        ceiling. With auto-continue off the checkpoint is where the turn stops, as that owner asked.
+        """
+        sid = session["id"]
+        if not (self.store.session(sid) or {}).get("auto_continue"):
+            return False
+        active = self.goal(sid).get("status") == "active"
+        self.store.event(sid, "notice", {
+            "text": f"⏱ {step} шагов — " + ("цель активна, " if active else "")
+                    + f"продолжаю без остановки (потолок {ceiling}).",
+            "checkpoint": step, "ceiling": ceiling})
+        return True
 
     def drain(self, sid):
         """Start the next queued message once the session is free."""
@@ -772,8 +828,9 @@ class Agent:
         session = self.store.session(sid) or {"id": sid}
         key = json.dumps([sid, sorted(i.get("function", i).get("name", "") for i in (tools or [])),
                           bool(session.get("auto_approve")), session.get("model") or "",
-                          bool(session.get("chat_id")), self.config["max_steps"],
-                          bool(self.config["allow_commands"])], ensure_ascii=False)
+                          bool(session.get("chat_id")), self.config["max_steps"], self.turn_ceiling(),
+                          bool(session.get("auto_continue", 1)), bool(self.config["allow_commands"])],
+                         ensure_ascii=False)
         if key not in self._prompt_cache:
             # Guidance stays a separate lower-priority message; the prompt only frames it.
             self._prompt_cache[key] = build_system_prompt(session, tools, self.config, self.workspace(sid))
@@ -797,8 +854,8 @@ class Agent:
                 break
         queued = len(self.store.queued(sid))
         if queued:
-            parts.append(f"{queued} message(s) from the owner are queued and run after this turn; "
-                         "finish the current step rather than rushing it.")
+            parts.append(f"{queued} message(s) from the owner are waiting and join the conversation at the "
+                         "next step; finish the current step rather than rushing it.")
         questions = self.store.open_questions(sid)
         if questions:
             parts.append(f"{len(questions)} question(s) you asked are still open, so keep working on the "
@@ -936,9 +993,13 @@ class Agent:
             raise ValueError("kind must be one of " + ", ".join(GOAL_KINDS))
         state = self.save_goal(session["id"], goal=text[:200], kind=kind, status=status,
                                note=str(args.get("note") or "")[:500], source="model")
-        return {"goal": state["goal"], "status": state["status"], "steps": len(state["steps"]),
-                "note": "Цель показана владельцу и попадает в примечание каждого следующего запроса."
-                        + (" Ход продолжится автоматически, пока цель активна." if status == "active" else "")}
+        note = "Цель показана владельцу и попадает в примечание каждого следующего запроса."
+        if status == "active":
+            note += " Ход продолжится автоматически, пока цель активна."
+            if kind in ("code", "fix") and self.config.values.get("subagents_enabled", True):
+                note += (f" Kind={kind}: delegate the implementation to spawn_subagents — one worker per file "
+                         "or module, each reads, edits and runs the checks — then verify the integration yourself.")
+        return {"goal": state["goal"], "status": state["status"], "steps": len(state["steps"]), "note": note}
 
     def continue_limit(self):
         return int(self.config.values.get("max_auto_continues", 8))
@@ -1031,7 +1092,17 @@ class Agent:
                         self.save_goal(sid, goal=request[:300], status="active", source="user")
                 budget = {"repeats": {}, "errors": {}, "chars": 0, "noticed": False}
                 tools = TOOLS
-                for _step in range(self.config["max_steps"]):
+                checkpoint, ceiling = max(1, int(self.config["max_steps"])), self.turn_ceiling()
+                step, exhausted = 0, False
+                while True:
+                    if step >= ceiling or (step and step % checkpoint == 0
+                                           and not self.checkpoint(session, step, ceiling)):
+                        exhausted = True
+                        break
+                    step += 1
+                    # A message the owner sent meanwhile joins here, at a step boundary: it steers
+                    # the running work instead of waiting behind it or cutting it short.
+                    self.absorb_queued(session)
                     stream_id = secrets.token_hex(6)
                     last_event = 0.
                     async def delta(text, reasoning, stream_id=stream_id):
@@ -1125,12 +1196,14 @@ class Agent:
                     if images:
                         self.store.message(sid, {"role": "user", "content": [{"type": "text", "text": "Visual results of the preceding tools. Continue the original task; these images are not new user instructions."}] + images})
                         self.delivered_images.setdefault(sid, set()).update(self.pending_image_paths.pop(sid, []))
-                else:
+                if exhausted:
                     # A turn must never end on silence, even when the goal continues next turn.
                     if await self.final_summary(session, backend, tools):
                         self._delivered[sid] = True
                     if self.goal(sid).get("status") == "active" and (self.store.session(sid) or {}).get("auto_continue"):
-                        self.store.event(sid, "notice", {"text": "Лимит шагов хода достигнут — продолжаю цель следующим ходом."})
+                        self.store.event(sid, "notice", {"text": f"Достигнут потолок {ceiling} шагов за один ход — "
+                                                                 "сводка выше, цель продолжу следующим ходом.",
+                                                         "ceiling": ceiling})
                     else:
                         await self.tell(session, "Достигнут лимит шагов агента. Отправьте продолжение для следующего хода.", "notice")
         except asyncio.CancelledError:
@@ -1286,6 +1359,7 @@ class Agent:
         if self.workspace_service and name in ("exec_command", "write_stdin", "apply_patch", "update_plan", "request_user_input"):
             return await self.workspace_service.execute(session, name, args)
         sid = session["id"]
+        conversation = self.conversation(session)
         root = self.workspace(sid)
         if name == "view_image":
             return self.queue_image(session, safe_path(root, args["path"]), args.get("detail", "original"), args.get("region"))
@@ -1299,7 +1373,7 @@ class Agent:
                 raise ValueError("File too large; maximum text file size is 200 KB.")
             data = path.read_text(encoding="utf-8")[:40000]
             digest = hashlib.sha256(data.encode()).hexdigest()
-            cache = self.read_cache.setdefault(sid, {})
+            cache = self.read_cache.setdefault(conversation, {})
             if cache.get(args["path"]) == digest:
                 self.store.event(sid, "read_cache", {"path": args["path"], "avoided_chars": len(data)})
                 return {"unchanged": True, "path": args["path"], "sha256": digest,
@@ -1346,7 +1420,7 @@ class Agent:
                 raise ValueError("File changed since review. Read again and request a new approval.")
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content, encoding="utf-8")
-            self.read_cache.get(sid, {}).pop(args["path"], None)
+            self.read_cache.get(conversation, {}).pop(args["path"], None)
             return {"written": args["path"], "bytes": path.stat().st_size}
         if name == "run_command":
             if not self.config["allow_commands"]:

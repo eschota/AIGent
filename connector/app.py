@@ -16,6 +16,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field
 
 from .agent import GOAL_STATUSES, Agent, safe_path
+from .api_entities import entities
 from .config import Config, password_hash, verify_password
 from .providers import DeepSeek, ProviderError, TelegramAPI, account_usage
 from .store import Store
@@ -54,10 +55,13 @@ class Settings(BaseModel):
     max_output_tokens: int = Field(default=8192, ge=256, le=65536)
     max_context_chars: int = Field(default=1000000, ge=8000, le=8000000)
     max_steps: int = Field(default=12, ge=1, le=40)
-    # Code subagents: omitted keys keep their stored value.
+    # The ceiling a turn may reach while its goal is active; omitted keeps the stored value.
+    max_turn_steps: int | None = Field(default=None, ge=1, le=1000)
+    # Coding workers: omitted keys keep their stored value.
     subagents_enabled: bool | None = None
     subagent_concurrency: int | None = Field(default=None, ge=1, le=8)
-    subagent_max_tokens: int | None = Field(default=None, ge=256, le=8192)
+    subagent_max_tokens: int | None = Field(default=None, ge=256, le=65536)
+    subagent_max_steps: int | None = Field(default=None, ge=1, le=200)
     update_repo: str = Field(default="eschota/AIGent", max_length=200)
     auto_update_check: bool = True
     # Omitted SSH keys keep their stored value: a settings form without them must not drop hosts.
@@ -420,7 +424,7 @@ def create_app(root: Path | None = None, polling=True):
                     "ffmpeg_path", "media_transcode_timeout_seconds", "media_cache_mb",
                     "allow_web", "web_search_url", "web_allow_private", "browser_binary",
                     "browser_timeout_seconds", "subagents_enabled", "subagent_concurrency",
-                    "subagent_max_tokens"):
+                    "subagent_max_tokens", "subagent_max_steps", "max_turn_steps"):
             if values.get(key) is None:
                 values.pop(key, None)
         if "chat_password" in values:
@@ -512,7 +516,7 @@ def create_app(root: Path | None = None, polling=True):
     @app.get("/api/sessions", dependencies=[Depends(require_admin)])
     async def list_sessions(archived: bool = False, deleted: bool = False):
         return [s | {"usage": store.usage(s["id"]), "telegram": sync.info(s),
-                     "resume": agent.pending_resume(s["id"])}
+                     "resume": agent.pending_resume(s["id"]), "spark": store.token_series(s["id"])}
                 for s in store.sessions(archived, deleted)]
 
     @app.post("/api/sessions/{sid}/resume", dependencies=[Depends(require_admin)])
@@ -963,6 +967,11 @@ def create_app(root: Path | None = None, polling=True):
     async def subagents_cancel(sid: str):
         require_session(sid)
         return subagents.cancel(sid)
+
+    @app.get("/api/entities", dependencies=[Depends(require_admin)])
+    async def list_entities():
+        """The API entities the chat can attach: each one names the endpoint that does its work."""
+        return {"entities": entities()}
 
     @app.get("/api/skills/status", dependencies=[Depends(require_admin)])
     async def skills_status():

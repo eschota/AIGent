@@ -16,6 +16,10 @@ import json
 import os
 import platform
 
+# Model calls one turn may spend before it must stop and summarize. `max_steps` is only a checkpoint
+# the turn passes while its goal is active; this ceiling is what actually ends a runaway turn.
+TURN_CEILING = 200
+
 CORE = """You are a coding agent in AIGent. Reply in the user's language.
 Preserve the language of the original task when subsequent image/tool delivery messages use another language.
 Work autonomously toward the result the user asked for. Do not stop at the first obstacle: diagnose it,
@@ -151,10 +155,28 @@ def build_system_prompt(session, tools, config, workspace_root, now=None, guidan
     else:
         lines.append("This session has no Telegram chat: send_file cannot deliver anything; "
                      "leave artifacts in the workspace and name their paths.")
-    lines.append(f"Step budget for this turn: {config['max_steps']} model calls. Plan for it and do not "
-                 "spend steps on repeated identical calls.")
-    lines.append("Messages the user sends during the turn are queued and processed after it; "
-                 "they do not interrupt you.")
+    ceiling = max(int(config["max_steps"]), int(config.values.get("max_turn_steps", TURN_CEILING)))
+    if session.get("auto_continue", 1):
+        lines.append(f"Steps: no fixed budget while the goal is active. Every {config['max_steps']} model calls "
+                     f"is a checkpoint the turn passes without stopping; the ceiling is {ceiling} calls per "
+                     "turn, after which the turn ends with a summary and continues later. Never stop early "
+                     "because of a step count; never spend steps on repeated identical calls.")
+    else:
+        lines.append(f"Step budget for this turn: {config['max_steps']} model calls, then the turn ends with a "
+                     "summary (auto-continue is off for this chat). Plan for it and do not spend steps on "
+                     "repeated identical calls.")
+    lines.append("Messages the user sends during the turn are delivered to you at the next step as ordinary "
+                 "user messages: they steer the current task and never interrupt a running tool.")
+    if "spawn_subagents" in names:
+        lines += ["", "## Delegation"]
+        lines.append("spawn_subagents runs coding workers in parallel: each has the workspace and execution "
+                     "tools, a fresh context and its own step budget, and executes in this session, so its "
+                     "writes go through the same review as yours. Delegate by default: for any code change "
+                     "beyond one small edit, split the work into independent tasks — one file or module each, "
+                     "with the acceptance criteria and the checks to run — and spawn them in ONE call. You keep "
+                     "the goal: read the reports, resolve conflicts between workers, run the integrated "
+                     "verification yourself and report the result. Edit a file yourself only for a small "
+                     "isolated change or after a worker failed on it.")
 
     lines += ["", "## Environment"]
     lines.append("The turn note appended after the conversation carries the date, the current goal and "

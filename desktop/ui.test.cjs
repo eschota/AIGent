@@ -115,7 +115,10 @@ test('expired auth recovers and retries identical message without losing the dra
   w.document.getElementById('message').value='Keep my draft';
   let renewed=0;const requests=[];
   w.aigentDesktop={reauthenticate:async()=>{renewed++;}};
-  w.fetch=async(_url,options)=>{requests.push(options);return new Response(JSON.stringify(requests.length===1?{detail:'expired'}:{accepted:true}),{status:requests.length===1?401:202,headers:{'content-type':'application/json'}});};
+  w.fetch=async(url,options)=>{
+    // Startup fetches (entities, status) are not the subject here: only the message request is counted.
+    if(!String(url).includes('/messages'))return new Response('{}',{status:200,headers:{'content-type':'application/json'}});
+    requests.push(options);return new Response(JSON.stringify(requests.length===1?{detail:'expired'}:{accepted:true}),{status:requests.length===1?401:202,headers:{'content-type':'application/json'}});};
   assert.deepEqual(await w.api('/api/sessions/auth-fixture/messages',{method:'POST',body:{text:'Keep my draft',request_id:'same'}}),{accepted:true});
   assert.equal(renewed,1);assert.equal(requests.length,2);assert.equal(requests[0].body,requests[1].body);
   assert.equal(w.document.getElementById('message').value,'Keep my draft');

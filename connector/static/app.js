@@ -187,7 +187,66 @@ document.addEventListener('paste',event=>{if(event.target!==$('message'))pasteHa
 const filePicker=el('input');filePicker.type='file';filePicker.multiple=true;filePicker.hidden=true;filePicker.id='composer-file-picker';
 document.body.append(filePicker);
 filePicker.onchange=handle(async()=>{const files=[...filePicker.files];filePicker.value='';await acceptFiles(files);});
+// API entities: round icons that behave like an attachment. Drag one into the composer (or click it)
+// and it lands as a chip and as a token in the text, so the agent knows which bridge to call.
+let apiEntities=[];
+function entityChip(entity){
+  const chip=el('span',undefined,'entity-chip');chip.dataset.entity=entity.id;chip.title=entity.hint||entity.label;
+  const art=el('span',undefined,'entity-art');art.innerHTML=entity.icon;
+  chip.append(art,el('span',entity.label,'entity-label'));
+  const drop=el('span','×','entity-drop');drop.title='Убрать';
+  drop.onclick=event=>{event.stopPropagation();chip.remove();syncEntityTokens(entity.id,false);};
+  chip.append(drop);return chip;
+}
+function entityChips(){return [...$('composer-attachments').querySelectorAll('.entity-chip')];}
+function syncEntityTokens(id,add){
+  const field=$('message');if(!field)return;
+  const entity=apiEntities.find(e=>e.id===id);if(!entity)return;
+  const token=entity.token;
+  if(add){if(!entityChips().some(chip=>chip.dataset.entity===id))$('composer-attachments').append(entityChip(entity));
+    if(!field.value.includes(token))field.value=(field.value?field.value.replace(/\s*$/,' '):'')+token+' ';}
+  else if(!entityChips().some(chip=>chip.dataset.entity===id))
+    field.value=field.value.split(token).join('').replace(/\s{2,}/g,' ').trim();
+  $('composer-attachments').hidden=!$('composer-attachments').children.length;
+  field.dispatchEvent(new Event('input'));
+}
+async function renderEntities(){
+  const strip=$('entities');if(!strip)return;
+  try{const data=await api('/api/entities');apiEntities=data.entities||[];}catch{return;}
+  strip.replaceChildren(...apiEntities.map(entity=>{
+    const button=el('button',undefined,'entity-button');button.type='button';button.title=entity.hint||entity.label;
+    button.dataset.entity=entity.id;button.draggable=true;
+    const art=el('span',undefined,'entity-art');art.innerHTML=entity.icon;button.append(art);
+    button.onclick=()=>syncEntityTokens(entity.id,true);
+    button.addEventListener('dragstart',event=>{
+      event.dataTransfer.setData('application/x-aigent-entity',entity.id);
+      event.dataTransfer.setData('text/plain',entity.token);
+      event.dataTransfer.effectAllowed='copy';
+      button.classList.add('dragging');
+    });
+    button.addEventListener('dragend',()=>button.classList.remove('dragging'));
+    return button;
+  }));
+}
+// The strip exists only after login: retry quietly until the entity list really arrives.
+let entityTries=0;
+function ensureEntities(){
+  const strip=$('entities');
+  if(!strip||strip.childElementCount||entityTries>20)return;
+  entityTries++;
+  renderEntities().then(()=>{if(!strip.childElementCount)setTimeout(ensureEntities,1200);});
+}
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',ensureEntities);
+else ensureEntities();
+
 for(const name of ['dragover','drop'])$('composer').addEventListener(name,event=>{
+  const draggedEntity=event.dataTransfer?.getData?.('application/x-aigent-entity');
+  if(draggedEntity){
+    event.preventDefault();
+    $('composer').classList.toggle('dropping',name==='dragover');
+    if(name==='drop')syncEntityTokens(draggedEntity,true);
+    return;
+  }
   if(!event.dataTransfer?.types?.includes('Files'))return;
   event.preventDefault();
   $('composer').classList.toggle('dropping',name==='dragover');
@@ -288,6 +347,74 @@ function sortSessions(list){
   else arr.sort((a,b)=>pin(a,b)||(Number(b.created)||0)-(Number(a.created)||0));
   return arr;
 }
+let collapsedProjects = (() => {
+  try { const saved = JSON.parse(localStorage.getItem('aigent-collapsed-projects') || '[]');
+        return Array.isArray(saved) ? saved : []; } catch { return []; }
+})();
+function saveCollapsedProjects(){
+  try { localStorage.setItem('aigent-collapsed-projects', JSON.stringify(collapsedProjects)); } catch {}
+}
+let sparkSignature = '';
+// An hour of real tokens as a tiny dual-line icon: teal climbs with what went in, violet with what
+// came out; wide apart means the model is writing fast. No labels — the tooltip carries the numbers.
+function tokenSpark(s){
+  const data = s.spark;
+  if(!data || !Array.isArray(data.series) || !data.series.length) return null;
+  const box = el('span', undefined, 'session-spark-box');
+  const peak = Math.max(1, ...data.series.map(p => Math.max(Number(p[0])||0, Number(p[1])||0)));
+  const busy = (Number(data.input)||0) + (Number(data.output)||0);
+  box.dataset.active = busy ? '1' : '0';
+  box.title = `Последний час · вход ${fmt(data.input)} · выход ${fmt(data.output)} токенов`;
+  const ns = 'http://www.w3.org/2000/svg', width = 46, height = 18, pad = 1.5;
+  const step = (width - 2*pad) / Math.max(1, data.series.length - 1);
+  const y = (v) => (height - pad - (Number(v)||0)/peak * (height - 2*pad)).toFixed(1);
+  const line = (index) => data.series.map((p,n) => `${(pad + n*step).toFixed(1)},${y(p[index])}`).join(' ');
+  const svg = document.createElementNS(ns, 'svg');
+  svg.setAttribute('class', 'session-spark');
+  svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+  svg.setAttribute('width', width); svg.setAttribute('height', height); svg.setAttribute('aria-hidden', 'true');
+  const draw = (tag, attrs) => { const node = document.createElementNS(ns, tag);
+    for(const [k,v] of Object.entries(attrs)) node.setAttribute(k, v); svg.append(node); };
+  const incoming = line(0), outgoing = line(1);
+  draw('polygon', {points: `${pad},${height-pad} ${incoming} ${width-pad},${height-pad}`, fill: 'rgba(121,237,208,.15)'});
+  draw('polyline', {points: incoming, fill: 'none', stroke: '#79edd0', 'stroke-width': '1.2',
+                    'stroke-linejoin': 'round', 'stroke-linecap': 'round'});
+  draw('polyline', {points: outgoing, fill: 'none', stroke: '#a896ef', 'stroke-width': '1.2',
+                    'stroke-linejoin': 'round', 'stroke-linecap': 'round'});
+  box.append(svg);
+  return box;
+}
+// Rendering happens elsewhere; this only regroups finished buttons, so an hour of idle time can
+// never rewrite the list into a different order than the owner sorted it in.
+function groupRenderedSessions(ordered){
+  const list = $('sessions'); if(!list) return;
+  const buttons = new Map([...list.querySelectorAll('.session-item')].map(b => [b.dataset.sessionId, b]));
+  const nodes = [], seen = new Set();
+  for(const s of ordered){
+    const key = s.project_id || '';
+    if(key && !seen.has(key)){
+      seen.add(key);
+      const collapsed = collapsedProjects.includes(key);
+      const header = el('button', undefined, 'project-group' + (collapsed ? ' collapsed' : ''));
+      header.type = 'button';
+      header.title = collapsed ? 'Развернуть проект' : 'Свернуть проект';
+      header.append(el('span', collapsed ? '▸' : '▾', 'project-caret'),
+                    el('span', (projectIndex[key] && projectIndex[key].name) || key, 'project-name'),
+                    el('span', String(ordered.filter(x => x.project_id === key).length), 'project-count'));
+      header.onclick = () => {
+        collapsedProjects = collapsed ? collapsedProjects.filter(x => x !== key) : [...collapsedProjects, key];
+        saveCollapsedProjects(); sparkSignature = ''; renderSessions();
+      };
+      nodes.push(header);
+      if(collapsed) continue;
+    } else if(key){
+      if(collapsedProjects.includes(key)) continue;
+    }
+    const button = buttons.get(s.id);
+    if(button) nodes.push(button);
+  }
+  list.replaceChildren(...nodes);
+}
 function renderSessions(){
   const ordered=sortSessions(allSessions);
   const nextSignature=JSON.stringify([current?.id,chatSort,ordered.map(s=>[s.id,s.title,s.status,s.pinned?1:0,s.usage?.cost_usd])]);
@@ -296,11 +423,21 @@ function renderSessions(){
   $('sessions').replaceChildren(...ordered.map(s => {
     const button = el('button', undefined, 'session-item' + (current?.id === s.id ? ' selected' : ''));
     button.dataset.sessionId=s.id;
+    button.dataset.projectId=s.project_id||'';
     const head=el('div',undefined,'session-item-head');
     head.append(el('span', s.title, 'session-title-text'));
+    const spark = tokenSpark(s);
+    if(spark) head.append(spark);
     const cost=el('span', chatCost(s.usage), 'session-cost-badge');cost.title=chatCostTitle(s.usage);
     head.append(cost);
     button.append(head, el('small', `${s.chat_id ? 'Telegram' : 'Web / API'} · ${s.status}`));
+    if(s.resume){
+      const chip = el('span', '⟳ Продолжить', 'session-resume');
+      chip.title = 'Ход прерван перезапуском сервера — вернуть агента к цели';
+      chip.onclick = handle(async (event) => { event.stopPropagation(); chip.textContent = '⟳ Возобновляю…';
+        await api(`/api/sessions/${s.id}/resume`, {method: 'POST'}); sparkSignature = ''; await refresh(); });
+      button.append(chip);
+    }
     button.onclick = handle(() => selectSession(s)); return button;
   }));
 }
@@ -516,6 +653,7 @@ function renderEvent(event) {
   // Ask the server which questions are still open: a replayed event must not reopen a closed one.
   if (kind === 'background_question') loadQuestions();
   if (kind === 'background_answered') closeBackgroundQuestion(p.id);
+  if (kind === 'queue_started') loadQueue();  // a queued message joined the running turn: drop it from the strip
   if (kind === 'goal') return;
   if (['approval', 'approval_closed', 'decision', 'read_cache'].includes(kind)) return;
   const nearBottom = $('chat-panel').scrollHeight - $('chat-panel').scrollTop - $('chat-panel').clientHeight < 160;
@@ -857,3 +995,16 @@ setText('api-url',location.origin+'/v1');
 if(!document.getElementById('selfheal-ui-script')){const s=document.createElement('script');s.id='selfheal-ui-script';s.src='/static/selfheal-ui.js';s.defer=true;document.head.appendChild(s);}
 (async()=>{const status=await api('/api/bootstrap');if(status.setup_required){setupToken=new URLSearchParams(location.hash.slice(1)).get('setup')||'';$('login').hidden=false;if(setupToken){$('settings-title').textContent='Первый запуск AIGent';$('settings-dialog').showModal();$('rotate-token').hidden=true;}}else{history.replaceState(null,'',location.pathname);try{await enter();}catch{$('workspace').hidden=true;$('login').hidden=false;}}})().catch(e=>toast(e.message));
 if(document.modelContext?.registerTool){const lifecycle=new AbortController();window.addEventListener('pagehide',()=>lifecycle.abort(),{once:true});Promise.resolve(document.modelContext.registerTool({name:'aigent_read_session_usage',title:'Read AIGent session usage',description:'Read real token and cache accounting for an existing session. Requires admin login.',inputSchema:{type:'object',properties:{session_id:{type:'string'}},required:['session_id'],additionalProperties:false},annotations:{readOnlyHint:true,untrustedContentHint:false},async execute(input){if(typeof input.session_id!=='string'||!/^[a-f0-9]{16}$/.test(input.session_id))throw new Error('Invalid session id');return api('/api/sessions/'+input.session_id+'/usage');}},{signal:lifecycle.signal})).catch(()=>{});}
+
+// Group the buttons renderSessions just produced; the grouping itself lives in groupRenderedSessions.
+const renderSessionsFlat = renderSessions;
+renderSessions = function(){
+  const ordered = sortSessions(allSessions);
+  const signature = JSON.stringify([current && current.id, chatSort, collapsedProjects, ordered.map(s => [
+    s.id, s.title, s.status, s.pinned ? 1 : 0, s.usage && s.usage.cost_usd, s.project_id,
+    s.resume && s.resume.prompt, s.spark && s.spark.input, s.spark && s.spark.output])]);
+  if(signature === sparkSignature){ groupRenderedSessions(ordered); return; }
+  sparkSignature = signature;
+  renderSessionsFlat();
+  groupRenderedSessions(ordered);
+};

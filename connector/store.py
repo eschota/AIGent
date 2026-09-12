@@ -250,6 +250,30 @@ class Store:
             self.close_question(row["id"], status)
         return [row["id"] for row in rows]
 
+    def token_series(self, sid, minutes=60, buckets=30):
+        """Incoming/outgoing tokens per bucket over the last hour, from recorded usage only.
+
+        The list shows real tokens the provider counted; if a chat has been idle nothing is
+        invented to fill the window, the curve stays flat at zero.
+        """
+        now = time.time()
+        span = max(1, int(minutes)) * 60
+        count = max(1, int(buckets))
+        width = span / count
+        series = [[0, 0] for _ in range(count)]
+        sql = "SELECT payload,created FROM usage WHERE session_id=? AND created>=? ORDER BY id"
+        for row in self.rows(sql, (sid, now - span)):
+            try:
+                data = json.loads(row["payload"])
+            except ValueError:
+                continue
+            index = min(count - 1, max(0, int((row["created"] - (now - span)) / width)))
+            series[index][0] += int(data.get("prompt_tokens") or 0)
+            series[index][1] += int(data.get("completion_tokens") or 0)
+        return {"minutes": int(minutes), "buckets": count, "series": series,
+                "input": sum(bucket[0] for bucket in series),
+                "output": sum(bucket[1] for bucket in series)}
+
     def add_usage(self, sid, usage):
         self.execute("INSERT INTO usage(session_id,payload,created) VALUES (?,?,?)",
                      (sid, json.dumps(usage), time.time()))

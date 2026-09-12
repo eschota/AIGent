@@ -33,6 +33,8 @@ class Config:
             "admin_password": "", "chat_password": "", "thinking": True,
             "allow_commands": False, "max_output_tokens": 8192,
             "max_context_chars": 1000000, "max_steps": 12,
+            # A turn passes `max_steps` as a checkpoint while its goal is active; this ceiling ends it.
+            "max_turn_steps": 200,
             "update_repo": "eschota/AIGent", "auto_update_check": True,
             "keep_recent_tool_results": 6, "max_turn_tool_chars": 300000,
             # Compaction hysteresis: once over the limit, compact down to this share of it, so the
@@ -48,8 +50,9 @@ class Config:
             "context_window_tokens": 128000,
             # How many times a turn may continue itself toward an active goal, per user message.
             "max_auto_continues": 8,
-            # Code subagents: parallel bounded DeepSeek completions that propose code pieces.
-            "subagents_enabled": True, "subagent_concurrency": 4, "subagent_max_tokens": 2000,
+            # Coding workers: parallel DeepSeek subagents with the workspace tools and their own budget.
+            "subagents_enabled": True, "subagent_concurrency": 4, "subagent_max_tokens": 8192,
+            "subagent_max_steps": 40,
             "pricing": {"deepseek-flash": [0.006, 0.3, 1.2], "deepseek-v4-pro": [0.044, 1.32, 3.96]},
             "pricing_date": "2026-09-11", "auth_epoch": 1,
             # Telegram mirror: the supergroup (topics enabled) that duplicates every IDE session.

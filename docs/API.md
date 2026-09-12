@@ -137,34 +137,44 @@ the goal still active continue by itself, at most `max_auto_continues` times per
 after an error, a cancellation, a pending approval or a blocking question. `GET /api/sessions/{id}/context` additionally reports
 `cache`: the hit/miss tokens and hit rate of the last request, or `known: false` when the API did not say.
 
-## Code subagents
+## Coding workers (subagents)
 
-The main DeepSeek agent fans out short code-writing subagents with the `spawn_subagents`
-tool: `{"tasks": [{"goal", "files"?, "context"?, "score"?}], "shared_context"?}`. Each subagent
-is a bounded, tool-less DeepSeek completion on the session's own account/model. Every subagent
-in a batch sends one **byte-identical prefix** — a fixed instruction plus `shared_context` — as
-its first message, so DeepSeek's prompt cache serves that prefix cheaply for the whole fan-out;
-only a small per-task tail differs. Subagents run in parallel up to `subagent_concurrency`
-(default 4, hard cap 8), with a tight `subagent_max_tokens` budget (default 2000). Set
+The main DeepSeek agent delegates code by default with the `spawn_subagents` tool:
+`{"tasks": [{"goal", "files"?, "context"?, "score"?}], "shared_context"?}` (at most 8 tasks;
+`score` 0..1 is a dispatch priority). Each worker is a real subagent with its own conversation
+and step budget (`subagent_max_steps`, default 40, cap 200) and the session's workspace and
+execution tools (`list_files`, `read_file`, `search_files`, `write_file`, `apply_patch`,
+`run_command`, `exec_command`, `write_stdin`); it runs in the session, so its writes and commands
+go through the same approval as the main agent's, and it cannot ask the owner, publish a goal or
+spawn workers. Workers run in parallel up to `subagent_concurrency` (default 4, hard cap 8) with
+`subagent_max_tokens` output per call (default 8192). Every worker of a batch sends one
+**byte-identical prefix** first — the worker instruction, the project guidance and
+`shared_context` — so the prompt cache serves it for the whole fan-out. Set
 `subagents_enabled: false` to hide the tool entirely.
 
-Subagents PRODUCE proposals — `{path, content | patch, summary}` — and never write; the main
-agent applies a winning piece with `write_file`/`apply_patch`, which still goes through review
-(or the session's explicit auto-apply). Each result also carries `score`, `tokens`, `cache_hit`,
-`cache_miss`, `cost_usd`, `context_tokens` and `seconds`. Scheduling is an honest hint: a rolling
-success score per (session, task-kind) is kept in `state`, higher-scored tasks are dispatched
-first, and each finished subagent's score (parseable code passing a quick syntax check, weighted
-with its cache-hit ratio) feeds that rolling average so repeated similar work tends to lead the queue.
+Each result carries `status` (`done`, `exhausted`, `failed`, `cancelled`), the plain-text
+`report`, `files` the worker changed, `steps`, `tokens`, `cache_hit`, `cache_miss`, `cost_usd`
+and `seconds`; the batch adds `totals` with the union of changed files.
 
 | Method | Endpoint | Purpose |
 | --- | --- | --- |
-| GET | `/api/sessions/{id}/subagents` | Live snapshot: `{subagents:[…], totals:{count,total,total_tokens,total_cost_usd,avg_score}}` |
+| GET | `/api/sessions/{id}/subagents` | Live snapshot: `{subagents:[…], totals:{count,total,total_tokens,total_cost_usd,total_steps}}` |
 | POST | `/api/sessions/{id}/subagents` | Debug spawn: `{tasks:[{goal,…}], shared_context?}` (the agent normally spawns via the tool) |
-| POST | `/api/sessions/{id}/subagents/cancel` | Stop every in-flight subagent of the session |
+| POST | `/api/sessions/{id}/subagents/cancel` | Stop every in-flight worker of the session |
 
 The panel updates live from `subagent` events (`phase: spawn|update|done`), each carrying the
-subagent's id, unique emoji + colour, brief goal, status, own context size, live runtime, tokens,
-cost and score. Settings keys: `subagents_enabled`, `subagent_concurrency`, `subagent_max_tokens`.
+worker's id, unique emoji + colour, brief goal, status, current tool (`activity`, `detail`),
+`steps`, `files`, `log`, `report`, runtime, tokens and cost. Settings keys: `subagents_enabled`,
+`subagent_concurrency`, `subagent_max_tokens`, `subagent_max_steps`.
+
+## Turn length
+
+`max_steps` is a checkpoint, not a limit: while the session's `auto_continue` is on, a turn
+passes it with a `notice` event (`checkpoint`, `ceiling`) and keeps working, up to
+`max_turn_steps` model calls (default 200), where it ends with a summary and schedules its
+continuation. With `auto_continue` off the checkpoint ends the turn. A message queued during a
+turn joins the conversation at the next step boundary (`queue_started` with `inline: true` and a
+`user` event with `inline: true`) instead of waiting for the turn to end.
 
 Event types include `user`, `stream`, `assistant`, `tool`, `tool_result`, `approval`, `decision`, `approval_closed`, `media`, `usage`, `context`, `goal`, `subagent`, `read_cache`, `error` and `notice`. Stream events carry cumulative `text` and provider `reasoning`, keyed by a stable stream `id`. Render the latest state instead of appending it as duplicate text.
 

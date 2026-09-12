@@ -173,7 +173,10 @@ worker's id, unique emoji + colour, brief goal, status, current tool (`activity`
 request is a flag in `state`, the restart happens after the last running turn ends, a verification
 message is queued for the requesting session first, and the process exits with code 3 for the
 supervisor to respawn it. Refused without `run.py --supervise`. The self-heal restart endpoint
-sets the same flag.
+sets the same flag. `server_status {}` (agent tool) returns the version, uptime, whether a
+supervisor runs the process, the safe fields of `supervisor.json` (state, revision, restarts,
+failures, good_revision, restored) and whether a restart is pending — the evidence the
+verification turn after a restart is asked for.
 
 ## Turn length
 

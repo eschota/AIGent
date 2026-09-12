@@ -23,3 +23,6 @@ shared/
 autorig/
 *-*-*-*-*.png
 review-*.diff
+
+# agent runtime state inside the workspace (temp files, trash)
+.aigent/

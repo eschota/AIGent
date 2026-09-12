@@ -38,6 +38,23 @@ page.
 Refs go stale after any page change; a failed `chrome_click` means "snapshot again". Never type
 the owner's password anywhere: a sign-in page is theirs to handle.
 
+## What worked on 2026-09-12 (Dynamic Ivy reel, 4 minutes end to end)
+
+- After sign-in YouTube may show a channel picker (`youtube.com/signin_prompt`): click the channel
+  by its name, then wait for `studio.youtube.com/channel/<id>`.
+- `https://studio.youtube.com/upload` answered "Oops, something went wrong": open the channel
+  dashboard, click **Create** (ref from the snapshot), then **Upload videos**.
+- `chrome_upload` with `selector: input[type=file]` accepted the absolute path; the Details step
+  appeared within seconds while the file kept uploading.
+- Stable selectors inside the dialog: title `ytcp-video-title #textbox` (contenteditable), description
+  `#description-textarea #textbox`, **Next** `#next-button` (three times), **Publish** `#done-button`;
+  the video link (`youtu.be/…`) is visible on the Visibility step before publishing. Refs shift while
+  the upload progress re-renders — prefer these selectors there.
+- YouTube warns when copyright checks are still running; wait for "Checks complete" before
+  **Publish** (the agent did, about a minute), then `chrome_wait` for "Video published".
+- Verify independently: an anonymous fetch of `youtube.com/oembed?url=<watch url>&format=json`
+  returns the title and channel once the video is public.
+
 ## DynIvy reel
 
 Everything for the Dynamic Ivy reel is prepared in `R:\AssetStore\ASStore26\DynIvy\store-listing\YOUTUBE.md`:

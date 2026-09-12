@@ -145,7 +145,14 @@ class Supervisor:
             self.log(f"cannot start child: {exc}")
             return 1
         try:
-            return process.wait()
+            try:
+                return process.wait(HEALTHY_SECONDS)
+            except subprocess.TimeoutExpired:
+                # Alive long enough to serve: say so. Until now the state stayed "starting" for
+                # the whole life of a healthy child, and the agent verifying its own restart
+                # could not tell a good revision from one that was still booting.
+                self.publish(state="running", revision=revision(self.root), pid=process.pid)
+                return process.wait()
         except KeyboardInterrupt:
             process.terminate()
             try:

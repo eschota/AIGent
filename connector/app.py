@@ -426,7 +426,8 @@ def create_app(root: Path | None = None, polling=True):
 
     @app.get("/healthz")
     async def health():
-        return {"status": "ok", "service": "aigent", "version": __version__, "configured": config.ready}
+        return {"status": "ok", "service": "aigent", "version": __version__, "configured": config.ready,
+                "uptime_seconds": int(time.time() - app.state.started)}
 
     @app.get("/api/identity")
     async def identity(nonce: str):

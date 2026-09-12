@@ -26,3 +26,7 @@ review-*.diff
 
 # agent runtime state inside the workspace (temp files, trash)
 .aigent/
+# Chrome and window screenshots the agent saves into a workspace
+chrome-*.png
+screen-*.png
+crop-*.png

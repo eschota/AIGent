@@ -63,6 +63,8 @@ class Config:
             "telegram_media_offload": False, "telegram_media_offload_mb": 20,
             "ssh_hosts": [], "ssh_binary": "", "ssh_timeout_seconds": 120,
             "ffmpeg_path": "", "media_transcode_timeout_seconds": 600, "media_cache_mb": 500,
+            # The owner's own Chrome as a tool: relaunched with a DevTools port on this profile.
+            "chrome_debug_port": 9333, "chrome_user_data_dir": "", "chrome_profile": "Default",
             "allow_web": True, "web_search_url": "https://html.duckduckgo.com/html/?q={query}",
             "web_allow_private": False, "browser_binary": "", "browser_timeout_seconds": 60,
             "project_map_budget_usd": 0.50,

@@ -69,7 +69,16 @@ class ToolBridge:
                     "isError": True}
         text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)
         failed = isinstance(result, dict) and bool(result.get("error"))
-        return {"content": [{"type": "text", "text": text}], "isError": failed}
+        content = [{"type": "text", "text": text}]
+        # A tool that queued pictures for the model (screenshots, view_image) hands them over as MCP
+        # image blocks; the engine shows them to a model that can see.
+        for part in self.agent.pending_images.pop(session["id"], []) or []:
+            url = str((part.get("image_url") or {}).get("url", "")) if isinstance(part, dict) else ""
+            head, _, data = url.partition(",")
+            if data:
+                content.append({"type": "image", "data": data, "mimeType": head.removeprefix("data:").split(";")[0] or "image/png"})
+        self.agent.pending_image_paths.pop(session["id"], None)
+        return {"content": content, "isError": failed}
 
     # ------------------------------------------------------------------ JSON-RPC
     async def handle(self, session, message):

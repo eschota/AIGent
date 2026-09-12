@@ -192,6 +192,15 @@ supervisor runs the process, the safe fields of `supervisor.json` (state, revisi
 failures, good_revision, restored) and whether a restart is pending — the evidence the
 verification turn after a restart is asked for.
 
+## The owner's Chrome
+
+Agent tools `chrome_open {url, restart_chrome?}`, `chrome_snapshot`, `chrome_click {ref|selector|text}`,
+`chrome_type {ref|selector|text, input, clear?, press_enter?}`, `chrome_press {key}`,
+`chrome_upload {ref|selector|text, path}`, `chrome_wait {text?, selector?, url_contains?, timeout_seconds?}`,
+`chrome_screenshot`, `chrome_eval {expression}` drive the owner's Chrome over DevTools (one tab per
+session). Approvals: relaunching Chrome, uploads, eval. Settings: `chrome_debug_port`,
+`chrome_user_data_dir`, `chrome_profile`.
+
 ## Turn length
 
 `max_steps` is a checkpoint, not a limit: while the session's `auto_continue` is on, a turn

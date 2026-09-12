@@ -40,6 +40,7 @@ from .subagents import SubAgents
 from .video_tools import VideoTools
 from .ssh_tools import SSHTools
 from .browser_tools import BrowserTools
+from .chrome_tools import ChromeTools
 from .media import MediaService, MediaUnavailable, UnsupportedMedia
 from .models import ModelError, ModelRegistry, asset_mime
 
@@ -277,6 +278,8 @@ def create_app(root: Path | None = None, polling=True):
     agent.extensions.append(ssh)
     browser = BrowserTools(agent, client)
     agent.extensions.append(browser)
+    chrome = ChromeTools(agent, client)
+    agent.extensions.append(chrome)
     skills = SkillIndex(config, store, agent.workspace)
     project_map = ProjectMap(config, store, agent, skills)
     agent.project_map = project_map
@@ -344,6 +347,7 @@ def create_app(root: Path | None = None, polling=True):
         await sync.close()
         await shared.close()
         await subagents.close()
+        await chrome.close()
         await project_map.close()
         await skills.stop()
         if bot.task:

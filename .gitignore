@@ -18,7 +18,7 @@ desktop/release/
 *.spec
 # agent scratch and attachment landing zones inside a project workspace
 .tmp/
-skills/
+/skills/
 shared/
 autorig/
 *-*-*-*-*.png

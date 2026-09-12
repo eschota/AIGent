@@ -149,3 +149,49 @@ async def test_a_clip_without_scene_cuts_still_yields_frames(bundle):
     assert all(frame.stat().st_size > 0 for frame in frames)
     result = await agent.execute(session, "video_inspect", {"path": "smooth.mp4", "frames": 5})
     assert result["frames_delivered"] is True and "error" not in result
+
+
+def make_voice(path, seconds=3):
+    subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+                    "-i", f"sine=frequency=420:duration={seconds}", str(path)], check=True, timeout=120)
+    return path
+
+
+@needs_ffmpeg
+async def test_segments_become_one_film_with_the_voice_over_the_ambience(bundle):
+    _, store, agent, tools, session = bundle
+    workspace = agent.workspace(session["id"])
+    make_video(workspace / "part1.mp4", seconds=2)
+    make_video(workspace / "part2.mp4", seconds=2, size="640x360")
+    make_voice(workspace / "voice.m4a", seconds=4)
+
+    result = await agent.execute(session, "video_assemble", {
+        "clips": ["part1.mp4", "part2.mp4"], "output": "film.mp4", "voice": "voice.m4a"})
+
+    assert result["segments"] == 2 and result["voice"] is True
+    assert (workspace / "film.mp4").is_file()
+    assert result["seconds"] == pytest.approx(4, abs=0.5), "both segments are in the timeline"
+    assert result["audio"] is True, "the narration survived the mix"
+    assert (result["width"], result["height"]) == (640, 360), "segments are padded to the largest frame"
+    assert any(e["kind"] == "media" for e in store.events(session["id"]))
+
+
+@needs_ffmpeg
+async def test_assembly_without_a_voice_keeps_a_silent_timeline(bundle):
+    _, _, agent, tools, session = bundle
+    workspace = agent.workspace(session["id"])
+    make_video(workspace / "solo.mp4", seconds=1)
+
+    result = await tools.assemble(session, ["solo.mp4"], "quiet.mp4", "", 0)
+
+    assert result["segments"] == 1 and result["voice"] is False
+    assert (workspace / "quiet.mp4").is_file()
+    assert result["seconds"] == pytest.approx(1, abs=0.35)
+
+
+async def test_assembly_refuses_missing_pieces(bundle):
+    _, _, agent, tools, session = bundle
+    with pytest.raises(ValueError):
+        await tools.assemble(session, [], "out.mp4", "", 0)
+    with pytest.raises(ValueError):
+        await tools.assemble(session, ["nope.mp4"], "out.mp4", "", 0)

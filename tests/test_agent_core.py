@@ -1024,3 +1024,41 @@ def test_context_size_reports_the_request_byte_budget(bundle):
     assert size["max_request_bytes"] == 4_000_000
     assert size["request_bytes"] > 120000 and size["request_bytes"] > size["chars"], "bytes count base64"
     assert size["request_percent"] == round(100 * size["request_bytes"] / 4_000_000, 1)
+
+
+async def test_a_blind_model_gets_images_described_by_the_vision_sidecar(bundle):
+    """An attached screenshot used to kill the turn with a provider error on deepseek-v4-pro."""
+    from connector.vision import contains_images
+
+    _, store, agent = bundle
+    session = store.resolve(44, 0, 1)
+    sid = session["id"]
+    store.update_session(sid, model="deepseek-v4-pro")
+    session = store.session(sid)
+    image = {"type": "image_url", "image_url": {
+        "url": "data:image/png;base64," + base64.b64encode(b"\x89PNG fake bytes").decode(), "detail": "original"}}
+    store.message(sid, {"role": "user", "content": [{"type": "text", "text": "вот скриншот меню"}, image]})
+    sidecar = Scripted([{"role": "assistant", "content": "Скриншот: слева узкая колонка с шестью крупными "
+                                                         "кнопками; в списке чатов помещается одна строка."}])
+    agent.vision_backend = lambda session: sidecar
+    backend = Scripted([{"role": "assistant", "content": "Понял: сожму меню."}])
+    agent.deepseek = backend
+
+    await agent.run(session, "сделай компактнее")
+    agent.note_activity(sid)
+
+    sent = backend.calls[0][0]
+    assert not contains_images(sent), "a model that cannot see never receives an image part"
+    assert any("Скриншот: слева узкая колонка" in str(m.get("content")) for m in sent)
+    assert any("deepseek-v4-pro cannot see it" in str(m.get("content")) for m in sent)
+    assert len(sidecar.calls) == 1 and contains_images(sidecar.calls[0][0]), "the sidecar saw the picture"
+    assert any("deepseek-flash" in (e["payload"].get("text") or "")
+               for e in store.events(sid) if e["kind"] == "notice")
+    assert contains_images(store.history(sid)), "the stored history keeps the picture for a vision model"
+    assert not any(e["kind"] == "error" for e in store.events(sid))
+
+    await agent.run(session, "и ещё")
+    agent.note_activity(sid)
+    assert len(sidecar.calls) == 1, "described once: the same picture is sent again every step and turn"
+    assert len(backend.calls) == 2 and not contains_images(backend.calls[1][0])
+

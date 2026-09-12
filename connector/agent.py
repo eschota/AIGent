@@ -36,6 +36,14 @@ TURN_KEY = "turn:"
 RESUME_KEY = "resume:"
 # Shown in place of an image dropped from the OUTGOING request to fit the byte budget.
 IMAGE_PLACEHOLDER = "[изображение убрано из контекста ради размера запроса]"
+# The model that looks at pictures on behalf of one that cannot: an attached screenshot reaches a
+# coding model as a precise description instead of killing the turn with a provider error.
+VISION_SIDECAR = "deepseek-flash"
+VISION_PROMPT = ("You describe images for a coding agent that cannot see them. Be precise and complete: the "
+                 "layout, every visible text label and value, the UI elements and their arrangement, sizes and "
+                 "proportions, colours, and anything that looks broken or cramped. Plain text, no markdown, "
+                 "no guesses about intent.")
+VISION_UNAVAILABLE = "[изображение: текущая модель не видит картинки, а описать его не удалось — переключите модель на deepseek-flash]"
 # Floor the per-turn byte budget never drops below, even under repeated 413 recovery.
 MIN_REQUEST_BYTES = 1_000_000
 GOAL_STATUSES = ("active", "blocked", "done")
@@ -426,7 +434,78 @@ class Agent:
                     "Результат фоновой задачи не получен: ход был прерван до ответа инструмента. "
                     "Проверь фактическое состояние прежде чем повторять шаг."})
 
-    async def complete_with_retry(self, backend, sid, tools, delta, attempts=3):
+    def vision_backend(self, session):
+        """The sidecar on the session's own account; None when no real DeepSeek client exists."""
+        base = self.deepseek
+        if not isinstance(base, DeepSeek):
+            return None
+        options = dict(self.config.values)
+        options["model"] = VISION_SIDECAR
+        account_id = session.get("account_id", "deepseek-default")
+        options["deepseek_key"] = (self.config["deepseek_key"] if account_id == "deepseek-default"
+                                   else self.config["account_keys"].get(account_id, ""))
+        options["thinking"] = False
+        options["max_output_tokens"] = 1500
+        return DeepSeek(options, base.client)
+
+    async def describe_one(self, sid, part):
+        """One picture through the sidecar; the description is what the blind model will read."""
+        session = self.store.session(sid) or {"id": sid}
+        backend = self.vision_backend(session)
+        if backend is None:
+            return None
+        messages = [{"role": "system", "content": VISION_PROMPT},
+                    {"role": "user", "content": [{"type": "text", "text": "Describe this image."}, part]}]
+        try:
+            message, usage = await backend.complete(messages, [], self._silent)
+        except (ProviderError, ValueError, OSError) as exc:
+            self.store.event(sid, "notice", {"text": "Сайдкар зрения не смог описать изображение: "
+                                                     + self.config.redact(exc)})
+            return None
+        if usage:
+            usage.update(provider="deepseek", account_id=session.get("account_id", "deepseek-default"),
+                         billing="api", sidecar="vision")
+            self.store.add_usage(sid, usage)
+        return ((message or {}).get("content") or "").strip() or None
+
+    async def describe_images(self, sid, messages, model):
+        """Outgoing copy for a model without vision: every image part becomes its description.
+
+        The stored history keeps the pictures, so switching the session to a vision model later
+        shows them for real. Descriptions are cached by the image bytes' digest: the same history
+        is sent again on every step and every turn, and the sidecar must look only once.
+        """
+        from .vision import VISION_MODELS, contains_images
+        if not model or model in VISION_MODELS or not contains_images(messages):
+            return messages
+        out, described = [], 0
+        for message in messages:
+            content = message.get("content")
+            if not isinstance(content, list) or not any(p.get("type") == "image_url" for p in content):
+                out.append(message)
+                continue
+            parts = []
+            for part in content:
+                if part.get("type") != "image_url":
+                    parts.append(part)
+                    continue
+                digest = hashlib.sha256(str(part.get("image_url", {}).get("url", "")).encode()).hexdigest()
+                text = self.store.get_state("vision:" + digest, "")
+                if not text:
+                    text = await self.describe_one(sid, part)
+                    if text:
+                        described += 1
+                        self.store.set_state("vision:" + digest, text)
+                parts.append({"type": "text", "text": f"[Image described by the vision model {VISION_SIDECAR} "
+                                                      f"because {model} cannot see it]: {text}" if text
+                              else VISION_UNAVAILABLE})
+            out.append(dict(message, content=parts))
+        if described:
+            self.store.event(sid, "notice", {"text": f"Модель {model} не видит изображения — {described} описал "
+                                                     f"сайдкар {VISION_SIDECAR}.", "vision_sidecar": described})
+        return out
+
+    async def complete_with_retry(self, backend, sid, tools, delta, attempts=3, model=None):
         """Transient provider faults must not end a turn; permanent ones are reported once.
 
         HTTP 413 (request too large) is recovered rather than reported: the pre-send byte budget may
@@ -440,6 +519,7 @@ class Agent:
             attempt += 1
             try:
                 messages = self.context(sid, request_budget=budget, drop_images=drop_images)
+                messages = await self.describe_images(sid, messages, model)
                 return await backend.complete(messages, tools, delta)
             except ProviderError as exc:
                 if getattr(exc, "too_large", False):
@@ -1106,9 +1186,10 @@ class Agent:
         try:
             async with self.slots:
                 backend = self.deepseek
+                model = session.get("model") or self.config["model"]
                 if isinstance(backend, DeepSeek):
                     options = dict(self.config.values)
-                    options["model"] = session.get("model") or self.config["model"]
+                    options["model"] = model
                     account_id = session.get("account_id", "deepseek-default")
                     options["deepseek_key"] = self.config["deepseek_key"] if account_id == "deepseek-default" else self.config["account_keys"].get(account_id, "")
                     backend = DeepSeek(options, backend.client)
@@ -1163,7 +1244,7 @@ class Agent:
                         tools = TOOLS + EXTRA_TOOLS
                     for extension in self.extensions:
                         tools = tools + extension.tools(session)
-                    message, usage = await self.complete_with_retry(backend, sid, tools, delta)
+                    message, usage = await self.complete_with_retry(backend, sid, tools, delta, model=model)
                     self.store.event(sid, "stream", {"id": stream_id, "text": message.get("content") or "",
                                                      "reasoning": message.get("reasoning_content") or "", "done": True})
                     self.store.message(sid, message)
@@ -1325,7 +1406,9 @@ class Agent:
         """A turn must never end on silence: one toolless call reports the state honestly."""
         sid = session["id"]
         try:
-            messages = self.context(sid, tools) + [{"role": "user", "content": SUMMARY_REQUEST}]
+            messages = await self.describe_images(sid, self.context(sid, tools),
+                                                  session.get("model") or self.config["model"])
+            messages = messages + [{"role": "user", "content": SUMMARY_REQUEST}]
             message, usage = await backend.complete(messages, [], self._silent)
         except (ProviderError, ValueError, OSError) as exc:
             self.store.event(sid, "notice", {"text": "Итоговая сводка не получена: " + self.config.redact(exc)})

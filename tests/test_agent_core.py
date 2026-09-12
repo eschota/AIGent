@@ -574,6 +574,49 @@ async def test_tool_event_reports_the_step_and_ceiling_of_the_turn(bundle):
     assert tools[1]["step"] == 2
 
 
+@pytest.mark.skipif(os.name != "nt", reason="batch files execute only on Windows")
+async def test_run_command_resolves_a_relative_executable_against_the_workspace(bundle):
+    config, store, agent = bundle
+    config.values["allow_commands"] = True
+    session = store.resolve(44, 0, 1)
+    sid = session["id"]
+    store.update_session(sid, auto_approve=1)
+    tools = agent.workspace(sid) / "tools"
+    tools.mkdir()
+    (tools / "hello.cmd").write_text("@echo hi\n", encoding="utf-8")
+
+    result = await agent.execute(session, "run_command", {"argv": ["tools/hello.cmd"]})
+
+    assert result["exit_code"] == 0
+    assert "hi" in result["output"]
+
+
+async def test_run_command_keeps_path_executables_unchanged(bundle, monkeypatch):
+    config, store, agent = bundle
+    config.values["allow_commands"] = True
+    session = store.resolve(45, 0, 1)
+    sid = session["id"]
+    store.update_session(sid, auto_approve=1)
+    captured = {}
+
+    class FakeProcess:
+        returncode = 0
+
+        async def wait(self):
+            return 0
+
+    async def fake_exec(*argv, **kwargs):
+        captured["argv"] = list(argv)
+        return FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    result = await agent.execute(session, "run_command", {"argv": ["git", "--version"]})
+
+    assert captured["argv"] == ["git", "--version"]
+    assert result["exit_code"] == 0
+
+
 async def test_a_checkpoint_never_ends_a_turn_that_works_toward_its_goal(bundle):
     config, store, agent = bundle
     config.values["max_steps"] = 2

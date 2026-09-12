@@ -1576,6 +1576,13 @@ class Agent:
             argv = args["argv"]
             if not isinstance(argv, list) or not argv or not all(isinstance(x, str) for x in argv):
                 raise ValueError("argv must be a nonempty string array.")
+            # A relative executable path (forward or back slashes) is resolved against the workspace
+            # root before the approval is shown, so the visible command is the one that actually runs.
+            executable = Path(argv[0])
+            if ("/" in argv[0] or "\\" in argv[0]) and not executable.is_absolute():
+                candidate = root / executable
+                if candidate.is_file():
+                    argv = [str(candidate)] + argv[1:]
             if not await self.approve(session, "run_command", json.dumps(argv, ensure_ascii=False) +
                                       "\ncwd: " + str(root) + "\nRuns with host permissions; not an OS sandbox.", True):
                 return {"denied": True}

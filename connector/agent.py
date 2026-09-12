@@ -105,6 +105,8 @@ class Agent:
         self._prompt_cache = {}
         self._turn_failed = set()  # Sessions whose last turn ended in an error or a cancellation.
         self._delivered = {}  # Sessions whose current turn actually produced an answer.
+        self._delegated = set()  # Sessions whose current turn spawned workers at least once.
+        self.after_turn = None  # Hook run when a turn is over, after the queue drained (lifecycle restart).
         self.activity = {}  # Monotonic stamp of the last thing the owner did in a session.
         self._auto_tasks = {}
         self.pending_images = {}
@@ -166,6 +168,8 @@ class Agent:
             self.mark_turn(sid, None)
         if not task.cancelled():
             self.drain(sid)
+        if self.after_turn:
+            self.after_turn(sid)
 
     def note_activity(self, sid):
         """Anything the owner does resets the automatic budget and cancels a pending continuation."""
@@ -837,9 +841,37 @@ class Agent:
         self._project_guidance[sid]["prompts"][key] = self._prompt_cache[key]
         return self._prompt_cache[key], guidance
 
+    def delegating(self, sid):
+        """True when this session offers workers: the switch is on and an extension provides the tool."""
+        if not self.config.values.get("subagents_enabled", True):
+            return False
+        session = self.store.session(sid) or {"id": sid}
+        return any(t["function"]["name"] == "spawn_subagents"
+                   for extension in self.extensions for t in extension.tools(session))
+
+    def delegation_hint(self, sid, name, args, result):
+        """A sizeable direct edit on a code goal gets a reminder that implementation belongs to workers."""
+        if name not in ("write_file", "apply_patch") or not isinstance(result, dict) or not isinstance(args, dict):
+            return
+        if result.get("error") or result.get("denied") or result.get("unchanged"):
+            return
+        if sid in self._delegated or self.goal(sid).get("kind") not in ("code", "fix") or not self.delegating(sid):
+            return
+        text = args.get("content") if name == "write_file" else args.get("patch")
+        if len(str(text or "").splitlines()) <= 30:
+            return
+        result["hint"] = ("Sizeable change written directly. The rest of the implementation belongs to "
+                          "spawn_subagents workers (one task per file or module); you verify the integration.")
+
     def background_note(self, sid):
         """A farm render can wait an hour inside its tool; the model must not start a second one."""
         parts = []
+        goal = self.goal(sid)
+        if (goal.get("kind") in ("code", "fix") and goal.get("status") == "active"
+                and sid not in self._delegated and self.delegating(sid)):
+            parts.append("no workers were spawned in this turn yet: for a change beyond one small edit, "
+                         "hand the implementation to spawn_subagents (one task per file or module, all in "
+                         "one call) and verify the integration yourself.")
         for extension in self.extensions:
             running = getattr(extension, "running", None)
             if not callable(running):
@@ -1086,6 +1118,7 @@ class Agent:
                                                "\n".join(p["text"] for p in content if p["type"] == "text")})
                 request = self.plain_text(content).strip()
                 self._turn_failed.discard(sid)
+                self._delegated.discard(sid)
                 if request and not request.startswith("Продолжай цель:") and request != AUTO_CONTINUE:
                     if not self.goal(sid).get("goal"):
                         # Deterministic first goal: no extra model call. set_goal refines it.
@@ -1165,6 +1198,9 @@ class Agent:
                                 started = time.monotonic()
                                 result = await self.execute(session, name, args)
                                 waited = time.monotonic() - started
+                                if name == "spawn_subagents":
+                                    self._delegated.add(sid)
+                                self.delegation_hint(sid, name, args, result)
                                 if waited >= LONG_TOOL_SECONDS:
                                     # A farm render waits inside its tool for up to an hour. That is work,
                                     # not a loop: the repeat counter must not end the turn because of it.

@@ -167,6 +167,14 @@ worker's id, unique emoji + colour, brief goal, status, current tool (`activity`
 `steps`, `files`, `log`, `report`, runtime, tokens and cost. Settings keys: `subagents_enabled`,
 `subagent_concurrency`, `subagent_max_tokens`, `subagent_max_steps`.
 
+## Self-update
+
+`restart_server {reason}` (agent tool) schedules a restart of the server on its current code: the
+request is a flag in `state`, the restart happens after the last running turn ends, a verification
+message is queued for the requesting session first, and the process exits with code 3 for the
+supervisor to respawn it. Refused without `run.py --supervise`. The self-heal restart endpoint
+sets the same flag.
+
 ## Turn length
 
 `max_steps` is a checkpoint, not a limit: while the session's `auto_continue` is on, a turn

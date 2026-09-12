@@ -32,6 +32,7 @@ from .computer import ComputerTools
 from .skill_manager import SkillIndex
 from .project_map import ProjectMap
 from .shared_tools import SharedTools
+from .lifecycle import Lifecycle
 from .subagents import SubAgents
 from .video_tools import VideoTools
 from .ssh_tools import SSHTools
@@ -275,6 +276,9 @@ def create_app(root: Path | None = None, polling=True):
     agent.extensions.append(subagents)
     video = VideoTools(agent, media)
     agent.extensions.append(video)
+    lifecycle = Lifecycle(agent, store, config)
+    agent.extensions.append(lifecycle)
+    agent.after_turn = lifecycle.after_turn
     bot = Bot(config, store, telegram, agent)
     sync = SessionSync(config, store, telegram, agent)
     agent.sync = sync
@@ -324,6 +328,7 @@ def create_app(root: Path | None = None, polling=True):
     app.state.config, app.state.store, app.state.agent, app.state.bot = config, store, agent, bot
     app.state.client, app.state.skills, app.state.shared = client, skills, shared
     app.state.subagents = subagents
+    app.state.lifecycle = lifecycle
     app.state.project_map = project_map
     app.state.sync = sync
     app.state.models3d = models3d

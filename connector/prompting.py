@@ -71,7 +71,9 @@ A long farm, render or build job belongs in its own tool, never in a polling she
 
 GROUPS = (
     ("Workspace files", ("list_files", "read_file", "search_files", "write_file", "apply_patch")),
+    ("Delegation", ("spawn_subagents",)),
     ("Execution", ("exec_command", "run_command", "write_stdin")),
+    ("Lifecycle", ("restart_server",)),
     ("Planning", ("set_goal", "update_plan", "request_user_input", "ask_user_async")),
     ("Vision", ("view_image",)),
     ("Delivery", ("send_file",)),

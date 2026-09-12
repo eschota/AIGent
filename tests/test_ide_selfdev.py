@@ -881,3 +881,42 @@ async def test_the_continuation_starts_by_itself_when_nobody_interrupts(bundle):
     started = [call.args[1] for call in agent.run.call_args_list]
     assert len(started) == 1 and "Продолжай цель: «собрать ролик»" in started[0]
     assert agent.continues[sid] == 1, "an automatic turn counts against the budget"
+
+
+# 31 ---------------------------------------------------------------------------------
+async def test_a_code_goal_is_steered_toward_workers_until_some_are_spawned(bundle):
+    """The prompt alone did not make DeepSeek delegate; the turn note and the tool results now do."""
+    from connector.subagents import SubAgents
+
+    _, store, agent = bundle
+    agent.extensions.append(SubAgents(agent, None))
+    session = store.resolve(60, 0, 1)
+    sid = session["id"]
+
+    await agent.execute(session, "set_goal", {"goal": "починить очередь", "kind": "fix", "status": "active"})
+    note = agent.turn_note(sid)
+    assert "no workers were spawned in this turn yet" in note and "spawn_subagents" in note
+
+    big = "\n".join(f"line {i}" for i in range(40))
+    store.update_session(sid, auto_approve=1)
+    result = await agent.execute(session, "write_file", {"path": "big.txt", "content": big})
+    agent.delegation_hint(sid, "write_file", {"path": "big.txt", "content": big}, result)
+    assert "spawn_subagents workers" in result["hint"], "a sizeable direct edit is answered with a reminder"
+
+    small = await agent.execute(session, "write_file", {"path": "small.txt", "content": "one line"})
+    agent.delegation_hint(sid, "write_file", {"path": "small.txt", "content": "one line"}, small)
+    assert "hint" not in small, "a small edit is the agent's own to make"
+
+    agent._delegated.add(sid)  # what the tool loop records after a spawn_subagents call
+    assert "no workers were spawned" not in agent.turn_note(sid)
+    later = await agent.execute(session, "write_file", {"path": "big2.txt", "content": big})
+    agent.delegation_hint(sid, "write_file", {"path": "big2.txt", "content": big}, later)
+    assert "hint" not in later, "once workers were used, direct integration edits pass without nagging"
+
+    await agent.execute(session, "set_goal", {"goal": "разобраться в логах", "kind": "analyze", "status": "active"})
+    agent._delegated.discard(sid)
+    assert "no workers were spawned" not in agent.turn_note(sid), "analysis is not delegated"
+    agent.extensions.clear()
+    await agent.execute(session, "set_goal", {"goal": "починить очередь", "kind": "fix", "status": "active"})
+    assert "no workers were spawned" not in agent.turn_note(sid), "never mention a tool that is absent"
+

@@ -102,9 +102,16 @@ class Lifecycle:
         request = self.pending()
         if not request:
             return False
-        if any(self.agent.busy(other) for other in list(self.agent.jobs)):
-            return False  # the next turn already started (a drained queue); try again after it
         target = request.get("sid") or sid
+        busy = [other for other in list(self.agent.jobs) if self.agent.busy(other)]
+        if busy:
+            # Another session's turn (or a drained queue) still runs: never cut it. The hook fires
+            # again when that turn ends, and the restart happens then.
+            if not request.get("deferred"):
+                self.store.set_state(RESTART_FLAG, json.dumps({**request, "deferred": True}))
+                self.store.event(target, "notice", {"text": "Перезапуск отложен: идёт ход другой сессии; "
+                                                            "выполню его сразу после завершения.", "restart": "deferred"})
+            return False
         self.store.set_state(RESTART_FLAG, "")
         if not self.supervised():
             self.store.event(target, "notice", {"text": "Перезапуск невозможен: сервер запущен без супервизора "

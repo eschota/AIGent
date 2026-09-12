@@ -283,6 +283,7 @@ def create_app(root: Path | None = None, polling=True):
     lifecycle = Lifecycle(agent, store, config)
     agent.extensions.append(lifecycle)
     agent.after_turn = lifecycle.after_turn
+    agent.restart_pending = lifecycle.pending
     bot = Bot(config, store, telegram, agent)
     sync = SessionSync(config, store, telegram, agent)
     agent.sync = sync

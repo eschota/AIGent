@@ -25,6 +25,7 @@ def bundle(tmp_path):
     lifecycle = Lifecycle(agent, store, config, exit=exits.append)
     agent.extensions.append(lifecycle)
     agent.after_turn = lifecycle.after_turn
+    agent.restart_pending = lifecycle.pending
     yield config, store, agent, lifecycle, exits
     store.db.close()
 
@@ -67,7 +68,8 @@ async def test_the_restart_waits_for_the_turn_and_queues_the_verification(bundle
     queued = store.queued(sid)
     assert len(queued) == 1 and queued[0]["payload"] == VERIFY_TEXT, "the next boot starts with a verification turn"
     notices = [e["payload"] for e in store.events(sid) if e["kind"] == "notice"]
-    assert [n.get("restart") for n in notices if n.get("restart")] == ["scheduled", "now"]
+    assert [n.get("restart") for n in notices if n.get("restart")] == ["scheduled", "deferred", "now"], \
+        "scheduled by the tool, deferred once while a turn ran, then performed"
 
 
 async def test_server_status_reports_the_supervisor_without_secrets(bundle, monkeypatch):
@@ -124,3 +126,35 @@ def test_the_app_offers_the_tool_and_installs_the_hook(tmp_path):
         names = {t["function"]["name"] for ext in agent.extensions for t in ext.tools(agent.store.session(sid))}
         assert "restart_server" in names and "spawn_subagents" in names
         assert agent.after_turn == app.state.lifecycle.after_turn
+
+
+async def test_a_pending_restart_owns_the_next_turn_and_waits_for_other_sessions(bundle, monkeypatch):
+    """The dev chat's auto-continuation ran against the old code while the restart waited."""
+    _, store, agent, lifecycle, exits = bundle
+    monkeypatch.setenv("AIGENT_SUPERVISED", "1")
+    session = store.resolve(6, 0, 1)
+    sid = session["id"]
+    agent.save_goal(sid, goal="cleanup shipped", status="active")
+    agent._delivered[sid] = True
+    await agent.execute(session, "restart_server", {"reason": "cleanup"})
+
+    assert agent.plan_continuation(session) is False, "no continuation against the old code"
+    notices = [e["payload"] for e in store.events(sid) if e["kind"] == "notice"]
+    assert notices[-1].get("restart") == "pending" and store.queued(sid) == []
+
+    class Running:
+        def done(self):
+            return False
+
+    other = store.resolve(7, 0, 1)["id"]
+    agent.jobs[other] = Running()
+    assert lifecycle.after_turn(sid) is False and exits == []
+    deferred = [e["payload"] for e in store.events(sid) if e["kind"] == "notice" and e["payload"].get("restart") == "deferred"]
+    assert len(deferred) == 1, "the owner is told once why nothing restarted yet"
+    assert lifecycle.after_turn(sid) is False and exits == []
+    assert len([e for e in store.events(sid) if e["kind"] == "notice" and e["payload"].get("restart") == "deferred"]) == 1
+
+    agent.jobs.pop(other)
+    assert lifecycle.after_turn(other) is True and exits == [RESTART_EXIT_CODE]
+    assert store.queued(sid)[0]["payload"] == VERIFY_TEXT, "the verification goes to the session that asked"
+

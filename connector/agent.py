@@ -118,6 +118,7 @@ class Agent:
         self._delivered = {}  # Sessions whose current turn actually produced an answer.
         self._delegated = set()  # Sessions whose current turn spawned workers at least once.
         self.after_turn = None  # Hook run when a turn is over, after the queue drained (lifecycle restart).
+        self.restart_pending = None  # Callable: a restart was requested and owns the next turn of its session.
         self.activity = {}  # Monotonic stamp of the last thing the owner did in a session.
         self._auto_tasks = {}
         self.pending_images = {}
@@ -1133,6 +1134,12 @@ class Agent:
         if not fresh.get("auto_continue") or goal.get("status") != "active" or not goal.get("goal"):
             return False
         if sid in self._turn_failed:
+            return False
+        if self.restart_pending and self.restart_pending():
+            # The verification turn queued by the restart is the continuation; one against the old
+            # code would chase endpoints that do not exist yet and "fix" what is not broken.
+            self.store.event(sid, "notice", {"text": "Перезапуск запланирован — цель продолжится проверочным "
+                                                     "ходом после него.", "restart": "pending"})
             return False
         waiting = {item["session"]["id"] for item in list(self.approvals.values()) + list(self.questions.values())}
         if used >= limit or self.store.queued(sid) or sid in waiting:

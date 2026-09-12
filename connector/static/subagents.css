@@ -99,3 +99,20 @@
 }
 .sa-detail .muted { color: #7f95a2; }
 .sa-detail .sa-log { color: #8aa0ad; max-height: 120px; }
+.subagents-summary {
+  display: block;
+  width: 100%;
+  margin-top: 8px;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.subagents-summary:hover { background: rgba(255,255,255,.05); }

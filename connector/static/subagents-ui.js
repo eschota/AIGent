@@ -11,7 +11,7 @@
   const tail = (s) => s.length > 28 ? '…' + s.slice(-27) : s;
   let sid = null;                 // the session the panel currently reflects
   const items = new Map();        // id -> record, insertion order preserved
-  let selected = null, timer = null;
+  let selected = null, timer = null, collapsed = false, collapseTimer = null;
 
   const panel = el('div', undefined, 'subagents-panel');
   panel.id = 'subagents-panel';
@@ -19,7 +19,7 @@
   const head = el('div', undefined, 'subagents-head');
   const total = el('div', undefined, 'subagents-total');
   const dot = el('span', undefined, 'sa-dot');
-  const totalText = el('span', 'Субагенты');
+  const totalText = el('span', 'Воркеры:');
   const totalSum = el('span', '', 'subagents-sum');
   total.append(dot, totalText, totalSum);
   const cancel = el('button', 'Отменить все', 'subagents-cancel');
@@ -28,7 +28,10 @@
   const chips = el('div', undefined, 'subagents-chips');
   const detail = el('div', undefined, 'sa-detail');
   detail.hidden = true;
-  panel.append(head, chips, detail);
+  const summary = el('button', '', 'subagents-summary');
+  summary.type = 'button';
+  summary.hidden = true;
+  panel.append(head, chips, detail, summary);
   // Sit with the other volatile bars just above the composer.
   const anchor = $('activity-bar') || $('composer');
   anchor.before(panel);
@@ -45,8 +48,12 @@
     sid = nextSid || null;
     items.clear();
     selected = null;
+    collapsed = false;
+    clearTimeout(collapseTimer);
+    collapseTimer = null;
     detail.hidden = true;
     detail.replaceChildren();
+    summary.hidden = true;
     render();
   }
 
@@ -83,11 +90,39 @@
     const tokens = list.reduce((s, r) => s + (r.tokens || 0), 0);
     const cost = list.reduce((s, r) => s + (r.cost_usd || 0), 0);
     const steps = list.reduce((s, r) => s + (r.steps || 0), 0);
+    const done = list.length - count;
     dot.style.visibility = count ? 'visible' : 'hidden';
-    totalText.textContent = count ? count + ' ' + plural(count, ['субагент', 'субагента', 'субагентов']) : 'Субагенты';
-    totalSum.textContent = `${steps} ш. · Σ ${fmt(tokens)} т. · Σ ${money(cost)}`;
+    totalText.textContent = 'Воркеры:';
+    const work = count > 0 ? `${count} ${plural(count, ['работает', 'работают', 'работают'])}` : '';
+    const doneText = done > 0 ? `${done} ${done % 10 === 1 && done % 100 !== 11 ? 'завершён' : 'завершены'}` : '';
+    const stepsText = steps > 0 ? `${steps} ${plural(steps, ['шаг', 'шага', 'шагов'])}` : '';
+    const tokensText = tokens > 0 ? `Σ ${tokens >= 1000 ? Math.round(tokens / 1000) + ' тыс.' : fmt(tokens)} токенов` : '';
+    const costText = cost > 0 ? money(cost) : '';
+    totalSum.textContent = [work, doneText, stepsText, tokensText, costText].filter(Boolean).join(' · ') || 'нет активных воркеров';
     cancel.hidden = count === 0;
 
+    if (count === 0 && list.length > 0) {
+      if (!collapsed && !collapseTimer) {
+        collapseTimer = setTimeout(() => { collapsed = true; collapseTimer = null; render(); }, 60000);
+      }
+    } else {
+      clearTimeout(collapseTimer);
+      collapseTimer = null;
+      collapsed = false;
+    }
+
+    if (collapsed) {
+      chips.hidden = true;
+      detail.hidden = true;
+      summary.hidden = false;
+      summary.textContent = `Воркеры завершены: ${list.length} · ${steps} ${plural(steps, ['шаг', 'шага', 'шагов'])} · Σ ${tokens >= 1000 ? Math.round(tokens / 1000) + ' тыс.' : fmt(tokens)} токенов${cost > 0 ? ' · ' + money(cost) : ''} · показать ▸`;
+      summary.onclick = () => { collapsed = false; clearTimeout(collapseTimer); collapseTimer = null; render(); };
+      if (count) startTimer(); else stopTimer();
+      return;
+    }
+
+    summary.hidden = true;
+    chips.hidden = false;
     chips.replaceChildren();
     for (const rec of list) {
       const chip = el('button', undefined, 'sa-chip ' + rec.status);
@@ -100,7 +135,7 @@
         ? seconds((Date.now() - rec.startMs) / 1000) : seconds(rec.seconds);
       const doing = LIVE.has(rec.status) && rec.activity
         ? ` · ${TOOL_ICONS[rec.activity] || '⚙️'} ${rec.activity}${rec.detail ? ' ' + tail(rec.detail) : ''}` : '';
-      const meta = el('span', `${clock} · ${rec.steps || 0} ш.${doing} · ${money(rec.cost_usd || 0)}`, 'sa-meta');
+      const meta = el('span', `${clock} · ${rec.steps || 0} ${plural(rec.steps || 0, ['шаг', 'шага', 'шагов'])}${doing} · ${money(rec.cost_usd || 0)}`, 'sa-meta');
       chip.append(meta);
       chip.title = (rec.goal || '') + ' · ' + statusLabel(rec.status);
       chip.onclick = () => { selected = selected === rec.id ? null : rec.id; renderDetail(); };

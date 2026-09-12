@@ -438,8 +438,40 @@ function renderSessions(){
         await api(`/api/sessions/${s.id}/resume`, {method: 'POST'}); sparkSignature = ''; await refresh(); });
       button.append(chip);
     }
-    button.onclick = handle(() => selectSession(s)); return button;
+    button.onclick = handle(() => selectSession(s));
+    button.ondblclick = handle((e)=>{ e.preventDefault(); e.stopPropagation(); const title = button.querySelector('.session-title-text'); if(title) startRename(s, title); });
+    return button;
   }));
+}
+function startRename(session, titleSpan){
+  const input = el('input', undefined, 'session-title-input');
+  input.value = session.title;
+  input.maxLength = 200;
+  titleSpan.replaceWith(input);
+  input.focus(); input.select();
+  let done=false;
+  const finish = async (commit) => {
+    if(done) return;
+    done=true;
+    const value=input.value.trim();
+    if(commit && value && value!==session.title){
+      try {
+        const updated = await api(`/api/sessions/${session.id}`, {method:'PATCH', body:{title:value}});
+        const idx = allSessions.findIndex(x=>x.id===session.id);
+        if(idx>=0) allSessions[idx]={...allSessions[idx], ...updated};
+        if(current && current.id===session.id){
+          current={...current, ...updated};
+          setText('session-title', updated.title);
+        }
+        sessionSignature=''; sparkSignature=''; renderSessions();
+        return;
+      } catch(e){ /* fall through to restore */ }
+    }
+    const span = el('span', session.title, 'session-title-text');
+    input.replaceWith(span);
+  };
+  input.onkeydown=(e)=>{ if(e.key==='Enter'){e.preventDefault(); finish(true);} else if(e.key==='Escape'){e.preventDefault(); finish(false);} };
+  input.onblur=()=>finish(true);
 }
 function renderTotalSpend(u){
   const node=$('total-spend');

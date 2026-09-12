@@ -99,6 +99,35 @@ test('right-click menu targets the clicked chat, including an unselected chat',a
   dom.window.close();
 });
 
+test('double-clicking a chat name edits its title and PATCHes the new name',async()=>{
+  const {dom,w}=ui();
+  const calls=[];
+  w.fetch=(url,opts)=>{
+    calls.push({url:String(url),opts});
+    const u=String(url);
+    let data=[];
+    if(u.includes('/api/status')) data={bot:'offline',username:null,error:null,model:'m',ui_revision:'1',version:'0.6.0',revision:'1',supervisor:{},usage:{prompt_tokens:0,completion_tokens:0,requests:0,cache_hit_percent:0,cache_hit_tokens:0,cost_usd:0,saved_usd:0},sessions:1};
+    else if(u.includes('/api/sessions/a1') && opts && opts.method==='PATCH') data={id:'a1',title:JSON.parse(opts.body).title,status:'idle'};
+    else if(u.includes('/api/sessions')) data=[{id:'a1',title:'Старый чат',status:'idle',created:1,pinned:false,project_id:null,provider:'deepseek',usage:{cost_usd:0.01,requests:1,prompt_tokens:10,completion_tokens:5,cache_hit_tokens:2},resume:null,spark:{series:[],input:0,output:0}}];
+    return Promise.resolve({ok:true,status:200,json:()=>Promise.resolve(data)});
+  };
+  await w.refresh();
+  const item=w.document.querySelector('.session-item');
+  assert.ok(item,'the refreshed session list contains the chat');
+  item.dispatchEvent(new w.MouseEvent('dblclick',{bubbles:true}));
+  const input=item.querySelector('input.session-title-input');
+  assert.ok(input,'double-click turns the title into an input');
+  input.value='Новый чат';
+  input.dispatchEvent(new w.KeyboardEvent('keydown',{key:'Enter',bubbles:true}));
+  await new Promise(r=>setTimeout(r,0));
+  const patch=calls.find(c=>c.opts&&c.opts.method==='PATCH');
+  assert.ok(patch,'Enter commits the new title through PATCH');
+  assert.ok(patch.url.includes('/api/sessions/a1'));
+  assert.deepEqual(JSON.parse(patch.opts.body),{title:'Новый чат'});
+  assert.match(w.document.querySelector('.session-title-text').textContent,/Новый чат/);
+  dom.window.close();
+});
+
 test('Start menu shortcut retains data path and correct packaged/development target',()=>{
   const options={executable:'C:\\Programs\\AIGent.exe',appDirectory:'C:\\Programs',dataDirectory:'R:\\My Project\\.local',icon:'C:\\Programs\\AIGent.exe'};
   const packed=shortcutOptions({...options,packaged:true});

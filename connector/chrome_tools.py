@@ -81,11 +81,11 @@ SNAPSHOT_JS = r"""
 })()
 """
 FIND_JS = r"""
-((ref, selector, text) => {
+((ref, selector, text, hidden) => {
   const all = [];
   const walk = (root) => { for (const el of root.querySelectorAll('*')) { all.push(el); if (el.shadowRoot) walk(el.shadowRoot); } };
   walk(document);
-  const visible = (el) => { const r = el.getBoundingClientRect(); return r.width >= 2 && r.height >= 2; };
+  const visible = (el) => { if (hidden) return true; const r = el.getBoundingClientRect(); return r.width >= 2 && r.height >= 2; };
   let found = null;
   if (ref !== null && ref !== undefined && ref !== '') found = all.find(el => el.getAttribute('data-aigent-ref') === String(ref)) || null;
   else if (selector) { for (const root of [document, ...all.filter(e => e.shadowRoot).map(e => e.shadowRoot)]) { const el = root.querySelector(selector); if (el && visible(el)) { found = el; break; } } }
@@ -94,7 +94,7 @@ FIND_JS = r"""
       || all.find(el => visible(el) && !el.children.length && (el.innerText || el.textContent || '').toLowerCase().includes(needle)) || null; }
   if (!found) return null;
   for (const el of all) if (el.hasAttribute('data-aigent-target')) el.removeAttribute('data-aigent-target');
-  found.scrollIntoView({ block: 'center', inline: 'center' });
+  try { found.scrollIntoView({ block: 'center', inline: 'center' }); } catch (e) {}
   const r = found.getBoundingClientRect();
   found.setAttribute('data-aigent-target', '1');
   return { x: r.left + r.width / 2, y: r.top + r.height / 2, tag: found.tagName.toLowerCase(), label: (found.getAttribute('aria-label') || found.innerText || found.value || '').trim().slice(0, 80), type: found.type || '' };
@@ -281,7 +281,11 @@ class ChromeTools:
     def launch_args(self, url):
         return [self.binary(), f"--remote-debugging-port={self.port()}", "--remote-allow-origins=*",
                 f"--user-data-dir={self.user_data_dir()}", f"--profile-directory={self.profile()}",
-                "--no-first-run", "--no-default-browser-check", "--new-window", url]
+                "--no-first-run", "--no-default-browser-check", "--start-maximized",
+                # An occluded or background tab stops rendering and the page believes it is hidden;
+                # YouTube Studio then never lays out its dialogs. Keep the agent's tab alive.
+                "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows",
+                "--disable-renderer-backgrounding", "--new-window", url]
 
     # ------------------------------------------------------------------ extension protocol
     def tools(self, session):
@@ -390,7 +394,16 @@ class ChromeTools:
         await socket.call("Page.enable")
         await socket.call("Runtime.enable")
         self.tabs[sid] = {"target": target["id"], "socket": socket}
+        await self.front(socket)
         return socket
+
+    async def front(self, socket):
+        """Make the tab the active, focused one: a hidden tab neither renders nor reacts."""
+        for method, params in (("Page.bringToFront", {}), ("Emulation.setFocusEmulationEnabled", {"enabled": True})):
+            try:
+                await socket.call(method, params, timeout=5)
+            except (ValueError, TimeoutError, ConnectionError):
+                pass
 
     async def open(self, session, url, restart):
         if not url.startswith(("http://", "https://")):
@@ -418,6 +431,7 @@ class ChromeTools:
                     socket = await self.attach(sid, None, url)
             if not state["launched"]:
                 await socket.call("Page.navigate", {"url": url})
+            await self.front(socket)
             await self.settle(socket, seconds=10)
             snapshot = await self.snapshot(socket)
             snapshot["launched_chrome"] = state["launched"]
@@ -453,15 +467,17 @@ class ChromeTools:
         return {"url": data.get("url"), "title": data.get("title"), "elements": data.get("elements") or [],
                 "text": data.get("text") or "", "note": "Click or type by ref; refs expire when the page changes."}
 
-    async def locate(self, socket, args):
+    async def locate(self, socket, args, hidden=False):
         ref = args.get("ref")
         found = await self.evaluate(socket, f"{FIND_JS}({json.dumps(ref if ref not in ('', None) else None)}, "
-                                            f"{json.dumps(args.get('selector') or None)}, {json.dumps(args.get('text') or None)})")
+                                            f"{json.dumps(args.get('selector') or None)}, {json.dumps(args.get('text') or None)}, "
+                                            f"{json.dumps(bool(hidden))})")
         if not found:
             raise ValueError("Element not found; take a fresh chrome_snapshot and use one of its refs.")
         return found
 
     async def click(self, socket, args):
+        await self.front(socket)
         found = await self.locate(socket, args)
         x, y = found["x"], found["y"]
         for kind in ("mouseMoved", "mousePressed", "mouseReleased"):
@@ -508,15 +524,16 @@ class ChromeTools:
             raise ValueError(f"File not found: {raw}")
         if not await self.agent.approve(session, "chrome_upload", f"{path}\n→ {socket.url}"):
             return {"denied": True}
+        await self.front(socket)
         target = args if any(args.get(k) not in (None, "") for k in ("ref", "selector", "text")) else {"selector": "input[type=file]"}
-        await self.locate(socket, target)
+        await self.locate(socket, target, hidden=True)  # file inputs are hidden by design behind a styled button
         handle = await socket.call("Runtime.evaluate", {"expression": TARGET_JS})
         node = (handle.get("result") or {})
         if not node.get("objectId"):
             raise ValueError("The target element vanished; take a fresh snapshot.")
         if node.get("className") != "HTMLInputElement":
             # A button that owns the file input: find the nearest file input in the document instead.
-            await self.locate(socket, {"selector": "input[type=file]"})
+            await self.locate(socket, {"selector": "input[type=file]"}, hidden=True)
             handle = await socket.call("Runtime.evaluate", {"expression": TARGET_JS})
             node = handle.get("result") or {}
         await socket.call("DOM.setFileInputFiles", {"files": [str(path)], "objectId": node["objectId"]})
@@ -527,6 +544,7 @@ class ChromeTools:
         timeout = max(1, min(50, int(args.get("timeout_seconds") or 30)))  # the MCP client gives a call one minute
         text, selector, url_part = args.get("text"), args.get("selector"), args.get("url_contains")
         deadline = time.monotonic() + timeout
+        await self.front(socket)
         while True:
             checks = []
             if url_part:

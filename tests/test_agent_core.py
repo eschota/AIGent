@@ -94,12 +94,26 @@ def test_vision_note_and_view_image_follow_the_model(config_bundle):
     assert "- view_image:" not in blind and "NOT available" in blind
 
 
-def test_send_file_is_not_offered_without_a_telegram_chat(config_bundle):
+def test_send_file_shows_inline_without_a_telegram_chat(config_bundle):
     config = config_bundle
     web = prompt(config, session={"chat_id": None})
-    assert "send_file cannot deliver anything" in web
+    assert "send_file shows the file inline in the web chat" in web
     chat = prompt(config, session={"chat_id": 12345})
     assert "send_file delivers an existing workspace artifact" in chat
+
+
+async def test_send_file_without_a_telegram_chat_emits_a_media_event(bundle):
+    config, store, agent = bundle
+    session = store.resolve(0, 0, 1)
+    sid = session["id"]
+    file = agent.workspace(sid) / "clip.mp4"
+    file.write_bytes(b"f" * 100)
+    result = await agent.execute(session, "send_file",
+                                 {"path": "clip.mp4", "kind": "video", "caption": "test"})
+    assert result["shown"] is True
+    media = [e for e in store.events(sid) if e["kind"] == "media"]
+    assert media and media[-1]["payload"] == {"path": "clip.mp4", "kind": "video",
+                                              "direction": "out", "caption": "test"}
 
 
 def test_prompt_carries_environment_budget_and_guidance(config_bundle):

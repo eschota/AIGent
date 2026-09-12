@@ -172,6 +172,15 @@ worker's id, unique emoji + colour, brief goal, status, current tool (`activity`
 `steps`, `files`, `log`, `report`, runtime, tokens and cost. Settings keys: `subagents_enabled`,
 `subagent_concurrency`, `subagent_max_tokens`, `subagent_max_steps`.
 
+## Engine
+
+`engine` (settings, `dsh` or `legacy`) selects what runs a DeepSeek session's turns. With `dsh`
+the connector drives one DeepSeek Harness runtime per session and offers its own tools to it over
+MCP at `POST /api/mcp/{sid}` (Streamable HTTP; JSON-RPC `initialize`, `tools/list`, `tools/call`,
+`ping`; authenticate with the connector token; `GET` answers 405). `GET /api/engine` reports the
+live runtimes: `{engine, available, runtimes, sessions:{sid:{dsh_session, prompts, idle_seconds}}}`.
+`dsh_idle_minutes` (default 20) closes a runtime nobody used; the next turn starts a new one.
+
 ## Self-update
 
 `restart_server {reason}` (agent tool) schedules a restart of the server on its current code: the

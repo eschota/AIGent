@@ -68,6 +68,7 @@ def main():
         if not args.no_browser:
             webbrowser.open(f"http://127.0.0.1:{args.port}/")
         return
+    os.environ.setdefault("AIGENT_PORT", str(args.port))  # the engine's MCP client calls back on this port
     temp = root / "tmp"
     temp.mkdir(parents=True, exist_ok=True)
     os.environ.update(TEMP=str(temp), TMP=str(temp), TMPDIR=str(temp))

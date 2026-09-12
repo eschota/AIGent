@@ -7,10 +7,11 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Literal
 
 import httpx
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field
@@ -32,7 +33,9 @@ from .computer import ComputerTools
 from .skill_manager import SkillIndex
 from .project_map import ProjectMap
 from .shared_tools import SharedTools
+from .dsh_engine import DshEngine
 from .lifecycle import Lifecycle
+from .mcp_bridge import ToolBridge
 from .subagents import SubAgents
 from .video_tools import VideoTools
 from .ssh_tools import SSHTools
@@ -58,6 +61,9 @@ class Settings(BaseModel):
     max_steps: int = Field(default=12, ge=1, le=40)
     # The ceiling a turn may reach while its goal is active; omitted keeps the stored value.
     max_turn_steps: int | None = Field(default=None, ge=1, le=1000)
+    # Which engine runs a session's turns; omitted keeps the stored value.
+    engine: Literal["dsh", "legacy"] | None = None
+    dsh_idle_minutes: int | None = Field(default=None, ge=1, le=1440)
     # Coding workers: omitted keys keep their stored value.
     subagents_enabled: bool | None = None
     subagent_concurrency: int | None = Field(default=None, ge=1, le=8)
@@ -284,6 +290,9 @@ def create_app(root: Path | None = None, polling=True):
     agent.extensions.append(lifecycle)
     agent.after_turn = lifecycle.after_turn
     agent.restart_pending = lifecycle.pending
+    bridge = ToolBridge(agent)
+    engine = DshEngine(agent, config, store)
+    agent.engine = engine
     bot = Bot(config, store, telegram, agent)
     sync = SessionSync(config, store, telegram, agent)
     agent.sync = sync
@@ -350,6 +359,8 @@ def create_app(root: Path | None = None, polling=True):
     app.state.client, app.state.skills, app.state.shared = client, skills, shared
     app.state.subagents = subagents
     app.state.lifecycle = lifecycle
+    app.state.engine = engine
+    app.state.bridge = bridge
     app.state.project_map = project_map
     app.state.sync = sync
     app.state.models3d = models3d
@@ -450,7 +461,8 @@ def create_app(root: Path | None = None, polling=True):
                     "ffmpeg_path", "media_transcode_timeout_seconds", "media_cache_mb",
                     "allow_web", "web_search_url", "web_allow_private", "browser_binary",
                     "browser_timeout_seconds", "subagents_enabled", "subagent_concurrency",
-                    "subagent_max_tokens", "subagent_max_steps", "max_turn_steps"):
+                    "subagent_max_tokens", "subagent_max_steps", "max_turn_steps", "engine",
+                    "dsh_idle_minutes"):
             if values.get(key) is None:
                 values.pop(key, None)
         if "chat_password" in values:
@@ -523,7 +535,7 @@ def create_app(root: Path | None = None, polling=True):
     async def status():
         return {"bot": bot.status, "username": bot.username, "error": bot.last_error,
                 "version": __version__, "revision": ui_revision(), "ui_revision": ui_revision(),
-                "supervisor": supervisor_state(),
+                "supervisor": supervisor_state(), "engine": config.values.get("engine", "dsh") if engine.enabled() else "legacy",
                 "started": app.state.started, "restarted": getattr(app.state, "restarted", None),
                 "usage": store.usage(), "sessions": len(store.sessions()),
                 "running": len(agent.jobs), "model": config["model"]}
@@ -982,6 +994,29 @@ def create_app(root: Path | None = None, polling=True):
     async def run_tool(sid: str, name: str, body: ToolBody):
         session = require_session(sid)
         return await shared.run(session, name, body.args)
+
+    @app.post("/api/mcp/{sid}", dependencies=[Depends(require_admin)])
+    async def mcp_endpoint(sid: str, request: Request):
+        """AIGent's tools for the session's engine, over MCP Streamable HTTP (JSON responses only)."""
+        session = require_session(sid)
+        try:
+            message = await request.json()
+        except ValueError:
+            return JSONResponse({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}},
+                                status_code=400)
+        status, body = await bridge.handle(session, message)
+        if body is None:
+            return Response(status_code=status)
+        return JSONResponse(body, status_code=status)
+
+    @app.get("/api/mcp/{sid}", dependencies=[Depends(require_admin)])
+    async def mcp_stream(sid: str):
+        require_session(sid)
+        return Response(status_code=405, headers={"Allow": "POST"})
+
+    @app.get("/api/engine", dependencies=[Depends(require_admin)])
+    async def engine_status():
+        return {"engine": config.values.get("engine", "dsh"), "available": engine.enabled(), **engine.status()}
 
     @app.get("/api/sessions/{sid}/subagents", dependencies=[Depends(require_admin)])
     async def subagents_snapshot(sid: str):

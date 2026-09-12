@@ -35,6 +35,9 @@ class Config:
             "max_context_chars": 1000000, "max_steps": 12,
             # A turn passes `max_steps` as a checkpoint while its goal is active; this ceiling ends it.
             "max_turn_steps": 200,
+            # The agent engine: "dsh" runs sessions on DeepSeek Harness (AIGent's tools reach it over MCP);
+            # "legacy" is the connector's own loop, kept as the fallback while the harness is a preview.
+            "engine": "dsh", "dsh_idle_minutes": 20, "dsh_reasoning_effort": "", "mcp_base_url": "",
             "update_repo": "eschota/AIGent", "auto_update_check": True,
             "keep_recent_tool_results": 6, "max_turn_tool_chars": 300000,
             # Compaction hysteresis: once over the limit, compact down to this share of it, so the

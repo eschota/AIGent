@@ -288,6 +288,7 @@
         badge.textContent = 'Перекодирование видео… ' + (tries * 2) + ' с';
       }).then(src => {
         badge.hidden = true;
+        const box = node('div', undefined, 'media-player-box');
         const player = node('video');
         player.controls = true;
         player.playsInline = true;
@@ -297,7 +298,20 @@
         player.poster = variantUrl(sid, path, 'poster');
         player.src = src;
         player.className = 'media-player';
-        frame.replaceWith(player);
+        const full = node('button', '⏶', 'media-fullscreen');
+        full.type = 'button';
+        full.title = 'На весь экран (Esc — выйти)';
+        full.onclick = () => {
+          if (document.fullscreenElement) {
+            document.exitFullscreen();
+          } else if (box.requestFullscreen) {
+            box.requestFullscreen();
+          } else if (box.webkitRequestFullscreen) {
+            box.webkitRequestFullscreen();
+          }
+        };
+        box.append(player, full);
+        frame.replaceWith(box);
       });
     };
     let extra = null;

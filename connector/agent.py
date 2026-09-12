@@ -80,7 +80,8 @@ TOOLS = [
     tool("ask_user_async", "Ask the owner a question without stopping: keep working on your stated assumption. "
          "The answer arrives as a normal message later.",
          {"question": STRING, "assumption": STRING}, ["question", "assumption"]),
-    tool("send_file", "Send an existing file to the current Telegram chat.",
+    tool("send_file", "Send an existing workspace file to the chat: delivered to Telegram when a chat is linked, "
+         "otherwise shown inline in the web chat.",
          {"path": STRING, "kind": {"type": "string", "enum": ["document", "photo", "audio", "voice",
           "video", "video_note", "animation", "sticker"]}, "caption": STRING}, ["path", "kind", "caption"]),
 ]
@@ -118,6 +119,7 @@ class Agent:
         self._delivered = {}  # Sessions whose current turn actually produced an answer.
         self._delegated = set()  # Sessions whose current turn spawned workers at least once.
         self.after_turn = None  # Hook run when a turn is over, after the queue drained (lifecycle restart).
+        self.engine = None  # An external engine (DeepSeek Harness) that runs the turn instead of the loop below.
         self.restart_pending = None  # Callable: a restart was requested and owns the next turn of its session.
         self.activity = {}  # Monotonic stamp of the last thing the owner did in a session.
         self._auto_tasks = {}
@@ -379,6 +381,8 @@ class Agent:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        if self.engine:
+            await self.engine.close()
         if self.local:
             await self.local.close()
         if self.workspace_service:
@@ -1188,8 +1192,60 @@ class Agent:
         self._auto_tasks.pop(sid, None)
         return self._start_continuation(sid, text)
 
+    async def engine_turn(self, session, content):
+        """A turn on the external engine: AIGent's bookkeeping around it, the loop itself is the engine's."""
+        sid = session["id"]
+        usage_before = self.store.usage(sid)
+        try:
+            async with self.slots:
+                self.store.event(sid, "user", {"text": self.plain_text(content)})
+                request = self.plain_text(content).strip()
+                self._turn_failed.discard(sid)
+                if request and not self.goal(sid).get("goal"):
+                    self.save_goal(sid, goal=request[:300], status="active", source="user")
+                await self.engine.turn(session, content)
+        except asyncio.CancelledError:
+            self._turn_failed.add(sid)
+            self.store.event(sid, "notice", {"text": "Ход остановлен. Уже выполненные изменения сохранены."})
+        except Exception as exc:
+            import traceback
+            self._turn_failed.add(sid)
+            self.store.event(sid, "trace", {"text": self.config.redact("".join(
+                traceback.format_exception(type(exc), exc, exc.__traceback__))[-4000:])})
+            try:
+                await self.tell(session, self.config.redact(f"{type(exc).__name__}: {exc}"), "error")
+            except ProviderError:
+                pass
+        finally:
+            await self._close_turn(session, usage_before, None, continuation=False)
+
+    async def _close_turn(self, session, usage_before, tg_id, continuation=True):
+        """What every turn does when it is over, whichever engine ran it."""
+        sid = session["id"]
+        self.store.execute("UPDATE sessions SET status='idle' WHERE id=?", (sid,))
+        if continuation:
+            try:
+                self.plan_continuation(session)
+            except (ValueError, KeyError):
+                pass
+        self.store.event(sid, "turn_completed", {"goal": self.goal(sid)})
+        self._project_guidance.pop(sid, None)
+        self.pending_images.pop(sid, None)
+        self.pending_image_paths.pop(sid, None)
+        after = self.store.usage(sid)
+        usage = {key: after[key] - usage_before[key] for key in ("requests", "prompt_tokens", "completion_tokens", "cache_hit_tokens", "cache_miss_tokens", "cost_usd", "saved_usd", "unknown_cache_requests", "unpriced_requests")}
+        try:
+            if tg_id:
+                await self.telegram.call("editMessageText", {"chat_id": session["chat_id"], "message_id": tg_id, "text": "✓ Ход завершён. Подробности сохранены в AIGent."})
+            if usage["requests"]:
+                await self.telegram.text(session, usage_text(usage))
+        except ProviderError:
+            pass
+
     async def run(self, session, content):
         sid = session["id"]
+        if self.engine and self.engine.handles(session):
+            return await self.engine_turn(session, content)
         self._project_guidance.pop(sid, None)
         usage_before = self.store.usage(sid)
         last_tg, tg_id = 0., None
@@ -1353,24 +1409,7 @@ class Agent:
             except ProviderError:
                 pass
         finally:
-            self.store.execute("UPDATE sessions SET status='idle' WHERE id=?", (sid,))
-            try:
-                self.plan_continuation(session)
-            except (ValueError, KeyError):
-                pass
-            self.store.event(sid, "turn_completed", {"goal": self.goal(sid)})
-            self._project_guidance.pop(sid, None)
-            self.pending_images.pop(sid, None)
-            self.pending_image_paths.pop(sid, None)
-            after = self.store.usage(sid)
-            usage = {key: after[key] - usage_before[key] for key in ("requests", "prompt_tokens", "completion_tokens", "cache_hit_tokens", "cache_miss_tokens", "cost_usd", "saved_usd", "unknown_cache_requests", "unpriced_requests")}
-            try:
-                if tg_id:
-                    await self.telegram.call("editMessageText", {"chat_id": session["chat_id"], "message_id": tg_id, "text": "✓ Ход завершён. Подробности сохранены в AIGent."})
-                if usage["requests"]:
-                    await self.telegram.text(session, usage_text(usage))
-            except ProviderError:
-                pass
+            await self._close_turn(session, usage_before, tg_id)
 
     def tool_payload(self, sid, result, budget):
         """Serialize a tool result and keep one turn from flooding the context."""
@@ -1640,7 +1679,11 @@ class Agent:
         if name == "send_file":
             path = safe_path(root, args["path"])
             if not session["chat_id"]:
-                return {"artifact": args["path"], "note": "Available in the web workspace; session has no Telegram chat."}
+                # No Telegram chat: publish the media event anyway so the web chat renders it inline.
+                self.store.event(sid, "media", {"path": args["path"], "kind": args["kind"],
+                                                "direction": "out", "caption": args["caption"]})
+                return {"shown": True, "path": args["path"], "kind": args["kind"],
+                        "note": "Shown inline in the web chat; no Telegram chat is linked to this session."}
             result = await self.telegram.media(session, path, args["kind"], args["caption"])
             if self.sync:
                 # Index the file_id now: the mirror must not upload the same file a second time.

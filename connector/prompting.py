@@ -157,8 +157,8 @@ def build_system_prompt(session, tools, config, workspace_root, now=None, guidan
     if session.get("chat_id"):
         lines.append("This session has a Telegram chat: send_file delivers an existing workspace artifact there.")
     else:
-        lines.append("This session has no Telegram chat: send_file cannot deliver anything; "
-                     "leave artifacts in the workspace and name their paths.")
+        lines.append("This session has no Telegram chat: send_file shows the file inline in the web chat; "
+                     "no copy reaches Telegram.")
     ceiling = max(int(config["max_steps"]), int(config.values.get("max_turn_steps", TURN_CEILING)))
     if session.get("auto_continue", 1):
         lines.append(f"Steps: no fixed budget while the goal is active. Every {config['max_steps']} model calls "

@@ -56,6 +56,37 @@ for chunk in client.chat.completions.create(
 
 Upload fields: `file`, `kind` (document/photo/audio/voice/video/video_note/animation/sticker), `caption`, `send_telegram` and `ask_agent`. Delivery always targets the selected session, never a caller-supplied chat ID. A web-only session has no Telegram destination. Any binary format can be stored as a document, subject to size limits.
 
+## Self-healing
+
+Turn any failure into a fix chat that repairs the code and closes itself.
+
+| Method | Endpoint | Purpose |
+| --- | --- | --- |
+| POST | `/api/sessions/{id}/heal` | `{"error_ref":<event id>?}` → create a fix chat and start it; returns `{"fix_sid","source_sid","session"}` |
+| GET | `/api/sessions/{id}/heal` | Fix chats spawned from this source, with status |
+| GET | `/api/heal` | All fix chats: `{fix_sid,source_sid,error_ref,status,title,archived,...}` |
+| POST | `/api/heal/{fix_sid}/confirm` | `{"verified":true,"restart":false}` → archive the fix chat and note both sides; `verified:false` keeps it open |
+| POST | `/api/heal/{fix_sid}/restart` | Explicit, user-confirmed restart request; refused while another turn is running |
+
+The fix chat **inherits** the source's provider, account, model, effort, project and resolved workspace,
+so it edits the same codebase. It **knows the prior context without copying the whole history**: a compact
+briefing is seeded as the first user message from the source's last goal, its recent tool actions and the
+specific error (the newest `error` + `trace`, or the event named by `error_ref`). The error text is fenced
+as DATA — never treated as instructions to the fixer. The turn starts immediately (`agent.submit`).
+
+`status` moves `open → archived` on confirm (`verified` is a transient marker). Confirming sets
+`sessions.archived=1` for the fix chat — recoverable, never deleted — and posts a closing note into both
+the fix and the source session.
+
+Restart is gated: it is refused while any other session's turn is running, and it is only ever triggered on
+an explicit request (the UI confirms first) — never automatically from observed error text. With
+`selfheal_restart_command` set in config it runs that command; otherwise it sets the store state flag
+`restart_requested` for the supervisor or desktop shell to pick up.
+
+Automation (off by default): with `auto_confirm_fixes` true, a fix chat whose turn ends after a
+`run_command`/`exec_command` result shows the project checks passing (`N passed` / `All checks passed`,
+exit code 0, no `N failed`) is auto-confirmed and archived. It never auto-restarts.
+
 ## Telegram session mirror
 
 Settings keys: `telegram_sync_chat_id` (the `-100…` id of a supergroup with topics enabled; empty = off),
@@ -106,7 +137,36 @@ the goal still active continue by itself, at most `max_auto_continues` times per
 after an error, a cancellation, a pending approval or a blocking question. `GET /api/sessions/{id}/context` additionally reports
 `cache`: the hit/miss tokens and hit rate of the last request, or `known: false` when the API did not say.
 
-Event types include `user`, `stream`, `assistant`, `tool`, `tool_result`, `approval`, `decision`, `approval_closed`, `media`, `usage`, `context`, `goal`, `read_cache`, `error` and `notice`. Stream events carry cumulative `text` and provider `reasoning`, keyed by a stable stream `id`. Render the latest state instead of appending it as duplicate text.
+## Code subagents
+
+The main DeepSeek agent fans out short code-writing subagents with the `spawn_subagents`
+tool: `{"tasks": [{"goal", "files"?, "context"?, "score"?}], "shared_context"?}`. Each subagent
+is a bounded, tool-less DeepSeek completion on the session's own account/model. Every subagent
+in a batch sends one **byte-identical prefix** — a fixed instruction plus `shared_context` — as
+its first message, so DeepSeek's prompt cache serves that prefix cheaply for the whole fan-out;
+only a small per-task tail differs. Subagents run in parallel up to `subagent_concurrency`
+(default 4, hard cap 8), with a tight `subagent_max_tokens` budget (default 2000). Set
+`subagents_enabled: false` to hide the tool entirely.
+
+Subagents PRODUCE proposals — `{path, content | patch, summary}` — and never write; the main
+agent applies a winning piece with `write_file`/`apply_patch`, which still goes through review
+(or the session's explicit auto-apply). Each result also carries `score`, `tokens`, `cache_hit`,
+`cache_miss`, `cost_usd`, `context_tokens` and `seconds`. Scheduling is an honest hint: a rolling
+success score per (session, task-kind) is kept in `state`, higher-scored tasks are dispatched
+first, and each finished subagent's score (parseable code passing a quick syntax check, weighted
+with its cache-hit ratio) feeds that rolling average so repeated similar work tends to lead the queue.
+
+| Method | Endpoint | Purpose |
+| --- | --- | --- |
+| GET | `/api/sessions/{id}/subagents` | Live snapshot: `{subagents:[…], totals:{count,total,total_tokens,total_cost_usd,avg_score}}` |
+| POST | `/api/sessions/{id}/subagents` | Debug spawn: `{tasks:[{goal,…}], shared_context?}` (the agent normally spawns via the tool) |
+| POST | `/api/sessions/{id}/subagents/cancel` | Stop every in-flight subagent of the session |
+
+The panel updates live from `subagent` events (`phase: spawn|update|done`), each carrying the
+subagent's id, unique emoji + colour, brief goal, status, own context size, live runtime, tokens,
+cost and score. Settings keys: `subagents_enabled`, `subagent_concurrency`, `subagent_max_tokens`.
+
+Event types include `user`, `stream`, `assistant`, `tool`, `tool_result`, `approval`, `decision`, `approval_closed`, `media`, `usage`, `context`, `goal`, `subagent`, `read_cache`, `error` and `notice`. Stream events carry cumulative `text` and provider `reasoning`, keyed by a stable stream `id`. Render the latest state instead of appending it as duplicate text.
 
 Desktop preview adds projects/accounts, local native history import, editor revisions, Git, terminal output, plans and user questions. See the running `/docs` for exact request schemas. `POST /api/sessions/{id}/fork` creates an independent conversation sharing the source workspace; `DELETE /api/sessions/{id}` stops and soft-deletes a chat; `GET /api/sessions?deleted=true` lists Trash and `POST /api/sessions/{id}/restore` restores it. No project files are removed.
 

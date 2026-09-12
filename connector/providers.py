@@ -7,11 +7,14 @@ import httpx
 class ProviderError(Exception):
     """Provider failure. `retryable` marks transient faults worth another attempt."""
 
-    def __init__(self, message, retryable=False, retry_after=0):
+    def __init__(self, message, retryable=False, retry_after=0, too_large=False):
         super().__init__(message)
         self.retryable = retryable
         # Telegram flood control answers 429 with parameters.retry_after seconds.
         self.retry_after = retry_after
+        # HTTP 413: the request body exceeded the provider's byte limit. Not retryable as-is —
+        # the agent loop must shed images / shrink the context before trying the same step again.
+        self.too_large = too_large
 
 
 def account_usage(raw, model, config, now=None):
@@ -74,10 +77,12 @@ class DeepSeek:
                     except ValueError:
                         detail = body[:300]
                     hint = {401: "проверьте ключ.", 402: "пополните баланс.", 400: "запрос отклонён.",
+                            413: "запрос слишком большой; уменьшаю контекст.",
                             429: "лимит запросов; повторяю."}.get(response.status_code, "ошибка провайдера.")
                     raise ProviderError(c.redact(f"DeepSeek HTTP {response.status_code}: {hint} {detail}".strip())
                                         if hasattr(c, "redact") else f"DeepSeek HTTP {response.status_code}: {hint} {detail}".strip(),
-                                        retryable=response.status_code in (408, 409, 429, 500, 502, 503, 504))
+                                        retryable=response.status_code in (408, 409, 429, 500, 502, 503, 504),
+                                        too_large=response.status_code == 413)
                 async for line in response.aiter_lines():
                     if not line.startswith("data:"):
                         continue

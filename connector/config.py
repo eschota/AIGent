@@ -38,8 +38,18 @@ class Config:
             # Compaction hysteresis: once over the limit, compact down to this share of it, so the
             # next step does not compact again and invalidate the cached prefix every time.
             "compact_target_ratio": 0.7,
+            # Byte budget of the OUTGOING request body (base64 image data included). max_context_chars
+            # measures model TEXT only and excludes base64; this caps the real HTTP body so a handful of
+            # vision frames cannot blow past DeepSeek/openresty's limit (commonly ~8-10 MB) with a 413.
+            # Leave headroom below the provider limit. max_image_bytes caps a SINGLE image at ingest.
+            "max_request_bytes": 6_000_000, "max_image_bytes": 3_000_000,
+            # The model's real context window: the composer meter compares the tokens the PROVIDER
+            # counted on the last request against it, instead of pretending a char budget is the window.
+            "context_window_tokens": 128000,
             # How many times a turn may continue itself toward an active goal, per user message.
             "max_auto_continues": 8,
+            # Code subagents: parallel bounded DeepSeek completions that propose code pieces.
+            "subagents_enabled": True, "subagent_concurrency": 4, "subagent_max_tokens": 2000,
             "pricing": {"deepseek-flash": [0.006, 0.3, 1.2], "deepseek-v4-pro": [0.044, 1.32, 3.96]},
             "pricing_date": "2026-09-11", "auth_epoch": 1,
             # Telegram mirror: the supergroup (topics enabled) that duplicates every IDE session.

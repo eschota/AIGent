@@ -23,6 +23,7 @@ from .sync import SessionSync
 from .telegram import Bot
 from .local_providers import LocalProviders
 from .updates import UpdateChannel
+from .selfheal import SelfHeal
 from .version import __version__
 from .workspace import WorkspaceService
 from .autorig import AutoRigTools
@@ -30,6 +31,7 @@ from .computer import ComputerTools
 from .skill_manager import SkillIndex
 from .project_map import ProjectMap
 from .shared_tools import SharedTools
+from .subagents import SubAgents
 from .video_tools import VideoTools
 from .ssh_tools import SSHTools
 from .browser_tools import BrowserTools
@@ -52,6 +54,10 @@ class Settings(BaseModel):
     max_output_tokens: int = Field(default=8192, ge=256, le=65536)
     max_context_chars: int = Field(default=1000000, ge=8000, le=8000000)
     max_steps: int = Field(default=12, ge=1, le=40)
+    # Code subagents: omitted keys keep their stored value.
+    subagents_enabled: bool | None = None
+    subagent_concurrency: int | None = Field(default=None, ge=1, le=8)
+    subagent_max_tokens: int | None = Field(default=None, ge=256, le=8192)
     update_repo: str = Field(default="eschota/AIGent", max_length=200)
     auto_update_check: bool = True
     # Omitted SSH keys keep their stored value: a settings form without them must not drop hosts.
@@ -138,6 +144,18 @@ class ToolBody(BaseModel):
     args: dict[str, str | int] = Field(default_factory=dict)
 
 
+class SubAgentTask(BaseModel):
+    goal: str = Field(min_length=1, max_length=2000)
+    files: list[str] | None = Field(default=None, max_length=20)
+    context: str | None = Field(default=None, max_length=8000)
+    score: float | None = Field(default=None, ge=0, le=1)
+
+
+class SubAgentsBody(BaseModel):
+    tasks: list[SubAgentTask] = Field(min_length=1, max_length=8)
+    shared_context: str = Field(default="", max_length=40000)
+
+
 class AnswerBody(BaseModel):
     answers: dict[str, str | list[str]]
 
@@ -169,6 +187,15 @@ class GitBody(BaseModel):
 
 class DecisionBody(BaseModel):
     accepted: bool
+
+
+class HealBody(BaseModel):
+    error_ref: int | None = None
+
+
+class HealConfirmBody(BaseModel):
+    verified: bool
+    restart: bool = False
 
 
 class GoalStep(BaseModel):
@@ -240,12 +267,15 @@ def create_app(root: Path | None = None, polling=True):
     agent.project_map = project_map
     shared = SharedTools(agent, client, skills)
     agent.extensions.append(shared)
+    subagents = SubAgents(agent, client)
+    agent.extensions.append(subagents)
     video = VideoTools(agent, media)
     agent.extensions.append(video)
     bot = Bot(config, store, telegram, agent)
     sync = SessionSync(config, store, telegram, agent)
     agent.sync = sync
     updates = UpdateChannel(client, config["update_repo"])
+    selfheal = SelfHeal(agent, store, config)
     failures = {}
 
     @asynccontextmanager
@@ -262,6 +292,9 @@ def create_app(root: Path | None = None, polling=True):
                 for item in store.sessions():
                     await sync.catch_up(item["id"])
             app.state.sync_task = asyncio.create_task(resume_sync())
+        # Nothing of the previous process survives a restart: close the turns the crash cut in half
+        # before starting anything, so no session keeps claiming to be running.
+        app.state.restarted = agent.reconcile_restart()
         for session in store.sessions():
             if store.queued(session["id"]):
                 agent.drain(session["id"])
@@ -272,6 +305,7 @@ def create_app(root: Path | None = None, polling=True):
             await asyncio.gather(task, return_exceptions=True)
         await sync.close()
         await shared.close()
+        await subagents.close()
         await project_map.close()
         await skills.stop()
         if bot.task:
@@ -285,11 +319,13 @@ def create_app(root: Path | None = None, polling=True):
                   description="Local agent connector. Authenticate with the admin cookie or connector Bearer token.")
     app.state.config, app.state.store, app.state.agent, app.state.bot = config, store, agent, bot
     app.state.client, app.state.skills, app.state.shared = client, skills, shared
+    app.state.subagents = subagents
     app.state.project_map = project_map
     app.state.sync = sync
     app.state.models3d = models3d
     app.state.started = time.time()
     app.state.updates = updates
+    app.state.selfheal = selfheal
 
     @app.middleware("http")
     async def protections(request, call_next):
@@ -383,7 +419,8 @@ def create_app(root: Path | None = None, polling=True):
                     "telegram_media_offload_mb", "ssh_hosts", "ssh_binary", "ssh_timeout_seconds",
                     "ffmpeg_path", "media_transcode_timeout_seconds", "media_cache_mb",
                     "allow_web", "web_search_url", "web_allow_private", "browser_binary",
-                    "browser_timeout_seconds"):
+                    "browser_timeout_seconds", "subagents_enabled", "subagent_concurrency",
+                    "subagent_max_tokens"):
             if values.get(key) is None:
                 values.pop(key, None)
         if "chat_password" in values:
@@ -456,7 +493,7 @@ def create_app(root: Path | None = None, polling=True):
     async def status():
         return {"bot": bot.status, "username": bot.username, "error": bot.last_error,
                 "ui_revision": ui_revision(), "supervisor": supervisor_state(),
-                "started": app.state.started,
+                "started": app.state.started, "restarted": getattr(app.state, "restarted", None),
                 "usage": store.usage(), "sessions": len(store.sessions()),
                 "running": len(agent.jobs), "model": config["model"]}
 
@@ -474,8 +511,21 @@ def create_app(root: Path | None = None, polling=True):
 
     @app.get("/api/sessions", dependencies=[Depends(require_admin)])
     async def list_sessions(archived: bool = False, deleted: bool = False):
-        return [s | {"usage": store.usage(s["id"]), "telegram": sync.info(s)}
+        return [s | {"usage": store.usage(s["id"]), "telegram": sync.info(s),
+                     "resume": agent.pending_resume(s["id"])}
                 for s in store.sessions(archived, deleted)]
+
+    @app.post("/api/sessions/{sid}/resume", dependencies=[Depends(require_admin)])
+    async def resume_session(sid: str):
+        """Continue the turn a restart interrupted; the offer is consumed on acceptance."""
+        session = require_session(sid)
+        pending = agent.pending_resume(sid)
+        if not pending and session.get("status") != "interrupted":
+            raise HTTPException(409, "Nothing to resume: this session was not interrupted by a restart")
+        try:
+            return agent.accept_resume(session) | {"resumed": True}  # type: ignore[operator]
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from None
 
     @app.delete("/api/sessions/{sid}", dependencies=[Depends(require_admin)])
     async def delete_session(sid: str):
@@ -566,6 +616,30 @@ def create_app(root: Path | None = None, polling=True):
                 break
             cursor = events[-1]["id"]
         return store.update_session(target["id"], **fields)
+
+    @app.post("/api/sessions/{sid}/heal", dependencies=[Depends(require_admin)])
+    async def heal(sid: str, body: HealBody):
+        """From an error in this session, spawn a fix chat that knows the context and starts fixing."""
+        require_session(sid)
+        return selfheal.create_fix_session(sid, body.error_ref)
+
+    @app.get("/api/sessions/{sid}/heal", dependencies=[Depends(require_admin)])
+    async def heal_for_source(sid: str):
+        require_session(sid)
+        return selfheal.list_fixes(sid)
+
+    @app.get("/api/heal", dependencies=[Depends(require_admin)])
+    async def heal_list():
+        return selfheal.list_fixes()
+
+    @app.post("/api/heal/{fix_sid}/confirm", dependencies=[Depends(require_admin)])
+    async def heal_confirm(fix_sid: str, body: HealConfirmBody):
+        return selfheal.confirm_fix(fix_sid, body.verified, body.restart)
+
+    @app.post("/api/heal/{fix_sid}/restart", dependencies=[Depends(require_admin)])
+    async def heal_restart(fix_sid: str):
+        """Explicit, user-confirmed restart request. Refused while another turn is running."""
+        return selfheal.restart_client(exclude_sid=fix_sid)
 
     @app.get("/api/projects", dependencies=[Depends(require_admin)])
     async def projects():
@@ -872,6 +946,24 @@ def create_app(root: Path | None = None, polling=True):
         session = require_session(sid)
         return await shared.run(session, name, body.args)
 
+    @app.get("/api/sessions/{sid}/subagents", dependencies=[Depends(require_admin)])
+    async def subagents_snapshot(sid: str):
+        require_session(sid)
+        return subagents.snapshot(sid)
+
+    @app.post("/api/sessions/{sid}/subagents", dependencies=[Depends(require_admin)])
+    async def subagents_spawn(sid: str, body: SubAgentsBody):
+        session = require_session(sid)
+        if not subagents.enabled():
+            raise HTTPException(409, "Subagents are disabled in settings")
+        return await subagents.spawn(session, [t.model_dump(exclude_none=True) for t in body.tasks],
+                                     body.shared_context)
+
+    @app.post("/api/sessions/{sid}/subagents/cancel", dependencies=[Depends(require_admin)])
+    async def subagents_cancel(sid: str):
+        require_session(sid)
+        return subagents.cancel(sid)
+
     @app.get("/api/skills/status", dependencies=[Depends(require_admin)])
     async def skills_status():
         return skills.status()
@@ -905,6 +997,9 @@ def create_app(root: Path | None = None, polling=True):
 
     @app.post("/api/questions/{qid}", dependencies=[Depends(require_admin)])
     async def answer(qid: str, body: AnswerBody):
+        item = agent.questions.get(qid)
+        if item:
+            agent.note_activity(item["session"]["id"])
         agent.answer(qid, body.answers, admin=True)
         return {"ok": True}
 
@@ -1001,6 +1096,7 @@ def create_app(root: Path | None = None, polling=True):
     @app.post("/api/sessions/{sid}/async-questions/{qid}", dependencies=[Depends(require_admin)])
     async def answer_async_question(sid: str, qid: str, body: AsyncAnswer):
         session = require_session(sid)
+        agent.note_activity(sid)
         answer = body.answer.strip()
         if not store.close_question(qid, "answered" if answer else "dismissed", answer or None):
             return {"closed": False, "note": "Вопрос уже закрыт"}
@@ -1026,10 +1122,14 @@ def create_app(root: Path | None = None, polling=True):
     @app.post("/api/sessions/{sid}/stop", dependencies=[Depends(require_admin)])
     async def stop(sid: str):
         require_session(sid)
+        agent.note_activity(sid)
         return {"stopped": agent.stop(sid)}
 
     @app.post("/api/approvals/{aid}", dependencies=[Depends(require_admin)])
     async def decision(aid: str, body: DecisionBody):
+        item = agent.approvals.get(aid)
+        if item:
+            agent.note_activity(item["session"]["id"])
         agent.decide(aid, body.accepted, admin=True)
         return {"ok": True}
 

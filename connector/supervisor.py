@@ -23,6 +23,7 @@ WATCHED = ("connector", "run.py")
 HEALTHY_SECONDS = 25  # a child that serves this long is considered a good revision
 MAX_BACKOFF = 60
 ROLLBACK_AFTER = 2  # consecutive early exits of a new revision before restoring the snapshot
+GIVE_UP_AFTER = 5  # early exits with no known-good revision before we stop, not loop forever
 
 
 def revision(root: Path):
@@ -123,6 +124,14 @@ class Supervisor:
                         self.publish(state="rolled_back", revision=rev, restored=self.good)
                         self.failures = 0
                         continue
+                if self.good is None and self.failures >= GIVE_UP_AFTER:
+                    # The child keeps dying at once and there is no good revision to fall back on —
+                    # almost always the port is already served by another instance. Stop rather
+                    # than respawn forever (the loop that produced 142 restarts).
+                    self.log(f"revision {rev} never started ({self.failures} early exits, exit {code}); "
+                             "giving up — is another instance already running on this port?")
+                    self.publish(state="gave_up", revision=rev, exit_code=code)
+                    return code
             delay = min(MAX_BACKOFF, 2 ** min(self.failures, 5))
             self.publish(state="restarting", revision=rev, exit_code=code, delay=delay)
             self.log(f"restarting in {delay}s")

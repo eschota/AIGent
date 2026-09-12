@@ -6,15 +6,21 @@ looping or flooding tool call is stopped before it burns the step budget.
 """
 
 import asyncio
+import base64
+import time
 import json
+import os
 from datetime import datetime
 from unittest.mock import AsyncMock
 
 import pytest
+from PIL import Image
 
-from connector.agent import SYSTEM, TOOLS, Agent
+from connector import agent as agent_module
+from connector.agent import IMAGE_PLACEHOLDER, SYSTEM, TOOLS, Agent
 from connector.config import Config, password_hash
 from connector.prompting import build_system_prompt, goal_summary, tool_inventory, turn_note
+from connector.providers import ProviderError
 from connector.store import Store
 
 
@@ -402,18 +408,44 @@ def test_context_size_reports_the_cache_of_the_last_request(bundle):
     assert cache["known"] and cache["hit_tokens"] == 910 and cache["percent"] == 91.0
 
 
-def test_context_size_reports_raw_and_compacted_sizes(bundle):
+def test_context_size_reports_what_would_be_sent_not_the_raw_pile(bundle):
     config, store, agent = bundle
     sid = store.resolve(33, 0, 1)["id"]
     config.values["max_context_chars"] = 20000
+    config.values["context_window_tokens"] = 64000
     config.values["keep_recent_tool_results"] = 1
     fill(store, sid, 8)
 
     size = agent.context_size(sid)
 
-    assert size["raw_chars"] == size["chars"] == agent.text_size(agent.sanitize(store.history(sid)))
-    assert size["compacted_chars"] < size["raw_chars"]
+    # Raw history keeps growing, but the meter reports the request the agent WOULD send after
+    # compaction — otherwise a trimmed session shows a permanently full budget forever.
+    assert size["raw_chars"] == agent.text_size(agent.sanitize(store.history(sid)))
+    assert size["compacted_chars"] == size["chars"] < size["raw_chars"]
+    assert size["raw_trimmed"] is True and size["raw_percent"] > 100 >= size["percent"]
+    # No request has gone out in this fixture, so the token count is an estimate and admits it.
+    assert size["provider_known"] is False and size["provider_tokens"] is None and size["estimated"] is True
+    assert size["window_tokens"] == 64000
+    assert size["window_percent"] == round(100 * size["tokens"] / 64000, 1)
     assert not [e for e in store.events(sid) if e["kind"] == "context"], "the meter must not write events"
+
+
+def test_context_size_uses_the_tokens_the_provider_really_counted(bundle):
+    config, store, agent = bundle
+    sid = store.resolve(34, 0, 1)["id"]
+    config.values["context_window_tokens"] = 64000
+    store.message(sid, {"role": "user", "content": "x" * 4000})
+
+    before = agent.context_size(sid)
+    assert before["estimated"] is True and before["tokens"] == round(before["chars"] / 4)
+
+    store.add_usage(sid, {"prompt_tokens": 32000, "completion_tokens": 5})
+    after = agent.context_size(sid)
+
+    # The window figure is the provider's own count, not a second guess from characters.
+    assert after["provider_known"] is True and after["estimated"] is False
+    assert after["provider_tokens"] == 32000 and after["window_percent"] == 50.0
+    assert after["provider_created"] and after["tokens"] == round(after["chars"] / 4), "chars stay chars"
 
 
 # --- loop guard, budget and error hints ---------------------------------------------
@@ -580,29 +612,42 @@ def test_a_bad_goal_is_refused_without_touching_the_stored_one(bundle):
     assert agent.goal(session["id"])["goal"] == "Рабочая цель"
 
 
+async def settle_started(agent, expected, timeout=2.0):
+    """The continuation is scheduled, not inline: let its task queue and start the next turn."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if len(agent.run.call_args_list) >= expected:
+            return True
+        await asyncio.sleep(0.01)
+    return False
+
+
 async def test_auto_continue_submits_a_follow_up_only_while_the_goal_is_unfinished(bundle):
     """One unified continuation: the goal drives it, `max_auto_continues` bounds it."""
     config, store, agent = bundle
     config.values["max_auto_continues"] = 2
+    agent_module.AUTO_CONTINUE_GRACE = 0  # the grace window is what the owner reads in; not needed here
+    agent.run = AsyncMock()  # the continuation now starts the turn itself; running it is another test
     session = store.resolve(47, 0, 1)
     sid = session["id"]
     agent.save_goal(sid, goal="Собрать ролик", auto_continue=True,
                     steps=[{"text": "кадры", "status": "completed"}, {"text": "видео", "status": "pending"}])
 
-    queued = []
     for used in range(3):
         agent.continues[sid] = used
+        agent._delivered[sid] = True  # the turn answered the owner; only then may it continue
         assert agent.plan_continuation(session) is (used < 2), "never more than the configured limit"
-        queued += [agent.plain_text(item["payload"]) for item in store.queued(sid)]
-        store.drop_queued(sid)
+        await settle_started(agent, min(used + 1, 2))
         agent.auto_pending.discard(sid)
-    assert len(queued) == 2 and all("Продолжай цель: «Собрать ролик»" in text for text in queued)
-    assert "Автопродолжение 2/2" in queued[1]
+    started = [call.args[1] for call in agent.run.call_args_list]
+    assert len(started) == 2 and all("Продолжай цель: «Собрать ролик»" in text for text in started)
+    assert "Автопродолжение 2/2" in started[1]
     notices = [e["payload"]["text"] for e in store.events(sid) if e["kind"] == "notice"]
-    assert len([t for t in notices if "продолжаю автоматически" in t]) == 2
+    assert len([t for t in notices if "Продолжу сам через" in t]) == 2
     assert any("Автопродолжение остановлено" in t for t in notices)
 
     agent.continues[sid] = 0
+    agent._delivered[sid] = True
     agent.save_goal(sid, status="done")
     assert agent.plan_continuation(session) is False, "a finished goal is not continued"
     agent.save_goal(sid, status="blocked")
@@ -617,17 +662,21 @@ async def test_auto_continue_waits_for_a_pending_approval_and_stops_after_a_fail
 
     agent.approvals["a1"] = {"future": asyncio.get_running_loop().create_future(), "session": session,
                              "admin_only": False, "name": "write_file", "detail": "diff"}
+    agent._delivered[sid] = True
     assert agent.plan_continuation(session) is False, "a waiting approval is not a stall to push through"
     agent.approvals.pop("a1")
 
     agent._turn_failed.add(sid)
+    agent._delivered[sid] = True
     assert agent.plan_continuation(session) is False, "an error or a cancellation ends the pursuit"
     agent._turn_failed.discard(sid)
+    agent._delivered[sid] = True
     assert agent.plan_continuation(session) is True
     store.drop_queued(sid)
     agent.auto_pending.discard(sid)
 
     store.update_session(sid, auto_continue=0)
+    agent._delivered[sid] = True
     assert agent.plan_continuation(session) is False, "the owner can switch the behaviour off per chat"
 
 
@@ -703,3 +752,162 @@ async def test_cancellation_and_provider_errors_still_end_the_turn_cleanly(bundl
     kinds = [e["kind"] for e in store.events(sid)]
     assert "notice" in kinds and kinds[-1] == "turn_completed"
     assert store.session(sid)["status"] == "idle"
+
+
+# --- the byte budget: the DeepSeek HTTP 413 crash ----------------------------------
+def image_message(size, tag="img"):
+    """A vision-result user message whose base64 payload is `size` bytes long."""
+    return {"role": "user", "content": [
+        {"type": "text", "text": tag},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64," + "A" * size}}]}
+
+
+def _image_count(messages):
+    return sum(1 for m in messages if isinstance(m.get("content"), list)
+               for p in m["content"] if p.get("type") == "image_url")
+
+
+def test_byte_budget_sheds_oldest_images_first_and_keeps_the_newest(bundle):
+    """text_size ignores base64, so a handful of vision frames pass the char budget yet blow the
+    real HTTP body. The byte budget sheds the OLDEST images, keeps the newest, and stays under."""
+    config, store, agent = bundle
+    sid = store.resolve(70, 0, 1)["id"]
+    config.values["max_request_bytes"] = 300000
+    store.message(sid, {"role": "user", "content": "task"})
+    for i in range(5):
+        store.message(sid, image_message(200000, f"img{i}"))
+
+    messages = agent.context(sid)
+
+    assert agent.well_formed(messages), "shedding must not orphan a tool message or split a turn"
+    assert agent.request_bytes(messages) <= config["max_request_bytes"], "outgoing body fits the budget"
+    survivors = [m for m in messages if isinstance(m.get("content"), list)
+                 and any(p.get("type") == "image_url" for p in m["content"])]
+    assert len(survivors) == 1, "only the newest image survives"
+    assert any(p.get("text") == "img4" for p in survivors[0]["content"]), "the newest image is the one kept"
+    assert any(IMAGE_PLACEHOLDER in str(m.get("content")) for m in messages), "old frames become placeholders"
+    stored = [m for m in store.history(sid) if isinstance(m.get("content"), list)]
+    assert len(stored) == 5 and _image_count(stored) == 5, "the stored history is never touched"
+    assert any("Убрано изображений" in e["payload"]["text"]
+               for e in store.events(sid) if e["kind"] == "context"), "the user is told images were shed"
+
+
+def test_image_shedding_is_deterministic(bundle):
+    """Same input twice → byte-identical output, so the DeepSeek prefix cache is not needlessly broken."""
+    config, store, agent = bundle
+    sid = store.resolve(72, 0, 1)["id"]
+    config.values["max_request_bytes"] = 300000
+    store.message(sid, {"role": "user", "content": "task"})
+    for i in range(5):
+        store.message(sid, image_message(200000, f"img{i}"))
+
+    first, second = agent.context(sid), agent.context(sid)
+    assert first == second, "recomputing the same history sheds the same images"
+    assert agent.request_bytes(first) == agent.request_bytes(second)
+
+
+class ByteTransport:
+    """A fake DeepSeek raising HTTP 413 for its first `fail_times` calls, then succeeding."""
+
+    def __init__(self, fail_times=0):
+        self.fail_times, self.calls = fail_times, []
+
+    async def complete(self, messages, tools, delta):
+        self.calls.append(_image_count(messages))
+        if len(self.calls) <= self.fail_times:
+            raise ProviderError("DeepSeek HTTP 413: запрос слишком большой.", too_large=True)
+        return {"role": "assistant", "content": "ok"}, {"prompt_tokens": 1, "completion_tokens": 1}
+
+
+class TooLargeWhileImagesPresent:
+    """A fake DeepSeek that 413s while ANY image is present, forcing the text-only fallback."""
+
+    def __init__(self):
+        self.calls = []
+
+    async def complete(self, messages, tools, delta):
+        n = _image_count(messages)
+        self.calls.append(n)
+        if n > 0:
+            raise ProviderError("DeepSeek HTTP 413.", too_large=True)
+        return {"role": "assistant", "content": "text ok"}, {"prompt_tokens": 1, "completion_tokens": 1}
+
+
+class AlwaysTooLarge:
+    async def complete(self, messages, tools, delta):
+        raise ProviderError("DeepSeek HTTP 413.", too_large=True)
+
+
+async def test_a_413_despite_the_budget_triggers_shedding_and_the_step_succeeds(bundle):
+    config, store, agent = bundle
+    sid = store.resolve(73, 0, 1)["id"]
+    config.values["max_request_bytes"] = 5_000_000
+    store.message(sid, {"role": "user", "content": "task"})
+    for i in range(3):
+        store.message(sid, image_message(200000, f"img{i}"))
+    backend = ByteTransport(fail_times=1)
+
+    message, usage = await agent.complete_with_retry(backend, sid, TOOLS, agent._silent)
+
+    assert message["content"] == "ok" and len(backend.calls) == 2, "the retry after 413 succeeds"
+    assert any("уменьшаю бюджет" in e["payload"]["text"]
+               for e in store.events(sid) if e["kind"] == "notice"), "the budget reduction is announced"
+
+
+async def test_a_413_falls_back_to_a_text_only_request(bundle):
+    config, store, agent = bundle
+    sid = store.resolve(74, 0, 1)["id"]
+    config.values["max_request_bytes"] = 2_000_000
+    store.message(sid, {"role": "user", "content": "task"})
+    for i in range(4):
+        store.message(sid, image_message(500000, f"img{i}"))
+    backend = TooLargeWhileImagesPresent()
+
+    message, usage = await agent.complete_with_retry(backend, sid, TOOLS, agent._silent)
+
+    assert message["content"] == "text ok"
+    assert backend.calls[-1] == 0, "the successful retry carried no images at all"
+    assert any("убираю все изображения" in e["payload"]["text"]
+               for e in store.events(sid) if e["kind"] == "notice")
+
+
+async def test_a_413_that_persists_even_text_only_surfaces_a_clear_error(bundle):
+    config, store, agent = bundle
+    sid = store.resolve(75, 0, 1)["id"]
+    config.values["max_request_bytes"] = 2_000_000
+    store.message(sid, {"role": "user", "content": "task"})
+    store.message(sid, image_message(500000, "img0"))
+
+    with pytest.raises(ProviderError, match="слишком большой даже без изображений"):
+        await agent.complete_with_retry(AlwaysTooLarge(), sid, TOOLS, agent._silent)
+
+
+def test_a_single_oversized_image_is_downscaled_at_ingest(tmp_path):
+    from connector.vision import image_content
+
+    big = tmp_path / "big.png"
+    Image.frombytes("RGB", (1500, 1500), os.urandom(1500 * 1500 * 3)).save(big, format="PNG")
+    assert big.stat().st_size > 2_000_000, "an incompressible PNG really is oversized"
+
+    parts = image_content(big, max_bytes=500_000)
+
+    url = parts[1]["image_url"]["url"]
+    assert url.startswith("data:image/jpeg;base64,"), "PNG that busts the cap falls back to JPEG"
+    data = base64.b64decode(url.split("base64,", 1)[1])
+    assert len(data) <= 500_000, "the encoded image is capped at ingest"
+    # No cap given → the lossless PNG path is preserved unchanged.
+    assert image_content(big)[1]["image_url"]["url"].startswith("data:image/png;base64,")
+
+
+def test_context_size_reports_the_request_byte_budget(bundle):
+    config, store, agent = bundle
+    sid = store.resolve(76, 0, 1)["id"]
+    config.values["max_request_bytes"] = 4_000_000
+    store.message(sid, {"role": "user", "content": "task"})
+    store.message(sid, image_message(120000, "img0"))
+
+    size = agent.context_size(sid)
+
+    assert size["max_request_bytes"] == 4_000_000
+    assert size["request_bytes"] > 120000 and size["request_bytes"] > size["chars"], "bytes count base64"
+    assert size["request_percent"] == round(100 * size["request_bytes"] / 4_000_000, 1)

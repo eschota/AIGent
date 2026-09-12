@@ -378,6 +378,7 @@ async function selectSession(session) {
   try{$('message').value=localStorage.getItem('aigent.draft.'+session.id)||'';localStorage.setItem('aigent.selectedSession',session.id);}catch{}
   if (window.innerWidth<=700) document.body.classList.remove('sidebar-collapsed');
   $('events').replaceChildren(); $('empty').hidden = true; setText('session-title', session.title); setText('read-saved', '0 символов');
+  window.SubAgents?.reset(session.id);
   renderGoal(null);
   let cursor = 0;
   while (true) {
@@ -852,5 +853,7 @@ $('rotate-token').onclick=handle(async()=>{const data=await api('/api/connector-
 $('logout-button').onclick=handle(async()=>{await api('/api/logout',{method:'POST'});location.reload();});
 document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=handle(async()=>{document.querySelectorAll('[data-tab]').forEach(x=>x.classList.toggle('active',x===b));for(const name of ['chat','files','usage'])$(name+'-panel').hidden=b.dataset.tab!==name;if(b.dataset.tab==='usage')await loadUsage();if(b.dataset.tab==='files')await loadFiles();}));
 setText('api-url',location.origin+'/v1');
+// Self-heal UI (repair button on errors, fix-chat banner) loads as a separate same-origin module.
+if(!document.getElementById('selfheal-ui-script')){const s=document.createElement('script');s.id='selfheal-ui-script';s.src='/static/selfheal-ui.js';s.defer=true;document.head.appendChild(s);}
 (async()=>{const status=await api('/api/bootstrap');if(status.setup_required){setupToken=new URLSearchParams(location.hash.slice(1)).get('setup')||'';$('login').hidden=false;if(setupToken){$('settings-title').textContent='Первый запуск AIGent';$('settings-dialog').showModal();$('rotate-token').hidden=true;}}else{history.replaceState(null,'',location.pathname);try{await enter();}catch{$('workspace').hidden=true;$('login').hidden=false;}}})().catch(e=>toast(e.message));
 if(document.modelContext?.registerTool){const lifecycle=new AbortController();window.addEventListener('pagehide',()=>lifecycle.abort(),{once:true});Promise.resolve(document.modelContext.registerTool({name:'aigent_read_session_usage',title:'Read AIGent session usage',description:'Read real token and cache accounting for an existing session. Requires admin login.',inputSchema:{type:'object',properties:{session_id:{type:'string'}},required:['session_id'],additionalProperties:false},annotations:{readOnlyHint:true,untrustedContentHint:false},async execute(input){if(typeof input.session_id!=='string'||!/^[a-f0-9]{16}$/.test(input.session_id))throw new Error('Invalid session id');return api('/api/sessions/'+input.session_id+'/usage');}},{signal:lifecycle.signal})).catch(()=>{});}

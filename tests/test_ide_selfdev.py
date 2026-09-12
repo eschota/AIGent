@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock
 import pytest
 from fastapi.testclient import TestClient
 
+from connector import agent as agent_module
 from connector import skill_manager
 from connector.agent import Agent
 from connector.app import create_app
@@ -543,9 +544,16 @@ async def test_context_meter_reports_the_budget_that_triggers_trimming(bundle):
     # request; with no request yet the cache is unknown.
     assert empty == {"chars": 2, "limit": 10000, "percent": 0.0, "messages": 0, "images": 0,
                      "tokens": 0, "limit_tokens": 2500,
-                     "raw_chars": 2, "compacted_chars": 2,
+                     "raw_chars": 2, "raw_percent": 0.0, "raw_trimmed": False, "compacted_chars": 2,
+                     # Nothing was sent yet: no provider count exists, so it is flagged as an estimate
+                     # instead of being reported as a measurement.
+                     "provider_tokens": None, "provider_known": False, "provider_created": None,
+                     "estimated": True, "window_tokens": config["context_window_tokens"],
+                     "window_percent": 0.0,
                      "cache": {"known": False, "hit_tokens": None, "miss_tokens": None,
-                               "prompt_tokens": None, "percent": None}}
+                               "prompt_tokens": None, "percent": None},
+                     "request_bytes": empty["request_bytes"], "max_request_bytes": config["max_request_bytes"],
+                     "request_percent": 0.0}
     assert empty["limit_tokens"] == round(10000 / 4), "the meter also reports an approximate token budget"
 
     store.message(sid, {"role": "user", "content": "x" * 2000})
@@ -555,13 +563,18 @@ async def test_context_meter_reports_the_budget_that_triggers_trimming(bundle):
 
     assert measured["messages"] == 2 and measured["images"] == 1
     assert 20 < measured["percent"] < 30, "base64 transport must not be counted as context text"
-    assert measured["chars"] == agent.text_size(store.history(sid))
+    # Under the budget nothing is trimmed, so the sent request is the whole history.
+    assert measured["chars"] == measured["compacted_chars"]
+    assert measured["raw_chars"] == agent.text_size(store.history(sid)) and measured["raw_trimmed"] is False
+    # The byte meter, unlike the char meter, DOES count the base64 image payload.
+    assert measured["request_bytes"] > 50000 and measured["request_bytes"] > measured["chars"]
 
 
 # 17 ---------------------------------------------------------------------------------
 async def test_an_open_goal_keeps_the_agent_working_without_a_new_user_message(bundle):
     config, store, agent = bundle
     config.values["max_auto_continues"] = 3
+    agent_module.AUTO_CONTINUE_GRACE = 0
     session = store.resolve(30, 0, 1)
     sid = session["id"]
     seen = []
@@ -571,6 +584,7 @@ async def test_an_open_goal_keeps_the_agent_working_without_a_new_user_message(b
         if len(seen) == 1:
             await agent.execute(session, "set_goal",
                                 {"goal": "собрать видео с Луны", "kind": "generate", "status": "active"})
+        agent._delivered[session["id"]] = True  # a turn that answered may continue
         agent.plan_continuation(session)
 
     agent.run = runner
@@ -591,14 +605,17 @@ async def test_a_finished_or_blocked_goal_stops_the_loop_immediately(bundle):
     session = store.resolve(31, 0, 1)
 
     await agent.execute(session, "set_goal", {"goal": "починить превью", "kind": "fix", "status": "active"})
+    agent._delivered[session["id"]] = True
     assert agent.plan_continuation(session) is True
     store.drop_queued(session["id"])
     agent.auto_pending.discard(session["id"])
 
     await agent.execute(session, "set_goal", {"goal": "починить превью", "kind": "fix", "status": "done"})
+    agent._delivered[session["id"]] = True
     assert agent.plan_continuation(session) is False, "a proven goal must not trigger another turn"
 
     await agent.execute(session, "set_goal", {"goal": "нужен эндпоинт фермы", "kind": "wait", "status": "blocked"})
+    agent._delivered[session["id"]] = True
     assert agent.plan_continuation(session) is False, "a blocked goal waits for the owner"
     goals = [e["payload"] for e in store.events(session["id"]) if e["kind"] == "goal"]
     assert [g["status"] for g in goals] == ["active", "done", "blocked"]
@@ -606,6 +623,7 @@ async def test_a_finished_or_blocked_goal_stops_the_loop_immediately(bundle):
 
     store.update_session(session["id"], auto_continue=0)
     await agent.execute(session, "set_goal", {"goal": "снова активна", "kind": "code", "status": "active"})
+    agent._delivered[session["id"]] = True
     assert agent.plan_continuation(session) is False, "the owner can switch the behaviour off per chat"
 
 
@@ -804,3 +822,62 @@ async def test_quality_preset_selects_the_high_quality_farm_workflow(bundle):
     assert manual["work_flow"] == "custom_anim.json", "an explicit name wins over the preset"
     assert {item["name"] for item in shared.catalogue()} == {"image", "video", "skill"}
     assert "quality" in {f["name"] for f in next(i for i in shared.catalogue() if i["name"] == "video")["fields"]}
+
+
+# 27 ---------------------------------------------------------------------------------
+async def test_a_turn_that_delivered_nothing_does_not_continue_itself(bundle):
+    """The owner watched eight silent rounds go by; a turn with no result now stops the loop."""
+    _, store, agent = bundle
+    session = store.resolve(50, 0, 1)
+    sid = session["id"]
+    await agent.execute(session, "set_goal", {"goal": "собрать ролик", "kind": "generate", "status": "active"})
+
+    agent._delivered.pop(sid, None)
+    assert agent.plan_continuation(session) is False, "nothing reached the owner, so nothing continues"
+    assert any("без результата" in e["payload"].get("text", "")
+               for e in store.events(sid) if e["kind"] == "notice")
+    assert not store.queued(sid)
+
+
+# 28 ---------------------------------------------------------------------------------
+async def test_owner_activity_cancels_a_pending_continuation_and_resets_the_budget(bundle):
+    """A message while the grace window runs wins: the automatic turn never starts."""
+    _, store, agent = bundle
+    agent_module.AUTO_CONTINUE_GRACE = 0.4
+    session = store.resolve(51, 0, 1)
+    sid = session["id"]
+    agent.run = AsyncMock()
+    await agent.execute(session, "set_goal", {"goal": "собрать ролик", "kind": "generate", "status": "active"})
+    agent.continues[sid] = 5
+    agent._delivered[sid] = True
+
+    assert agent.plan_continuation(session) is True, "the continuation is scheduled, not sent yet"
+    assert not store.queued(sid), "nothing is queued during the grace window"
+    assert any("Продолжу сам через" in e["payload"].get("text", "")
+               for e in store.events(sid) if e["kind"] == "notice")
+
+    agent.submit(session, "стой, сделай иначе")  # the owner speaks inside the window
+    assert agent.continues[sid] == 0, "owner activity resets the automatic budget"
+    await asyncio.sleep(0.6)
+    started = [call.args[1] for call in agent.run.call_args_list]
+    assert started == ["стой, сделай иначе"], started
+    assert any("отменено" in e["payload"].get("text", "")
+               for e in store.events(sid) if e["kind"] == "notice")
+
+
+# 29 ---------------------------------------------------------------------------------
+async def test_the_continuation_starts_by_itself_when_nobody_interrupts(bundle):
+    _, store, agent = bundle
+    agent_module.AUTO_CONTINUE_GRACE = 0.2
+    session = store.resolve(52, 0, 1)
+    sid = session["id"]
+    agent.run = AsyncMock()
+    await agent.execute(session, "set_goal", {"goal": "собрать ролик", "kind": "generate", "status": "active"})
+    agent._delivered[sid] = True
+
+    assert agent.plan_continuation(session) is True
+    await asyncio.sleep(0.5)
+
+    started = [call.args[1] for call in agent.run.call_args_list]
+    assert len(started) == 1 and "Продолжай цель: «собрать ролик»" in started[0]
+    assert agent.continues[sid] == 1, "an automatic turn counts against the budget"

@@ -169,9 +169,47 @@ provider's access controls. Images from ChatGPT are brought in by the owner with
       "Continue toward the goal…" itself, at most `auto_continue_limit` (5) times per user message, never
       after an error, a cancellation or a pending approval/question.
 - [x] A tool that waited ≥ `LONG_TOOL_SECONDS` for a background job (farm render) does not count as a loop.
+- [x] Code subagents (`connector/subagents.py`, extension): `spawn_subagents {tasks:[{goal,files?,context?,score?}],
+      shared_context?}` fans out bounded, tool-less DeepSeek completions in parallel. All subagents in a batch send
+      one byte-identical prefix (fixed instruction + `shared_context`) so DeepSeek's prompt cache serves it for the
+      whole fan-out; only the small task tail differs. Concurrency `subagent_concurrency` (4, hard cap 8),
+      budget `subagent_max_tokens` (2000), hidden when `subagents_enabled` is off.
+- [x] Subagents PRODUCE proposals `{path, content|patch, summary}` and never write; applying still goes through
+      write_file/apply_patch review (or session auto-apply). Result carries score/tokens/cache/cost/context/seconds.
+- [x] Honest scheduler hint: rolling success score per (session, task-kind) in `state`; higher-scored tasks
+      dispatched first; each finish updates the score by syntax-check success and cache-hit ratio. `running(sid)`
+      and `cancel(sid)`; `GET /api/sessions/{sid}/subagents`, `POST …/subagents`, `POST …/subagents/cancel`.
+- [x] Live panel (`subagents-ui.js`/`subagents.css`): a chip per subagent with unique emoji+colour, brief goal,
+      live runtime, own context size and cost; header total `N субагентов · Σ tokens · Σ $`; cancel-all; DOM-only,
+      collapses when idle; fed by `subagent` SSE events.
+- [ ] Owner acceptance: on a real multi-file task, confirm subagent cache-hit stays high across the batch and the
+      winning pieces still surface an exact diff for review before landing.
 - [ ] Owner acceptance: run a real multi-step farm job (frames → video → delivery) and confirm the reported
       cache hit rate stays high across turns and the goal bar tracks the work.
 - [ ] Derive the goal bar's styling from the shared stylesheet instead of inline styles.
+
+## Self-healing: fix chats that repair the code and close themselves (2026-09-12)
+
+- [x] `connector/selfheal.py` — `SelfHeal(agent, store, config)`: `create_fix_session(source_sid, error_ref?)`
+      makes a new session inheriting the source's provider/account/model/effort/project/workspace, seeded with a
+      compact briefing (last goal, recent tool actions, the newest `error`+`trace` or the event named by
+      `error_ref`) as the first user message — the whole history is NOT copied — and starts the turn at once.
+      Linkage in a `fix_sessions` table `{fix_sid,source_sid,error_ref,status,created,updated}`.
+- [x] `confirm_fix(fix_sid, verified, restart?)`: on `verified` sets `status=archived`, archives the fix chat
+      (`sessions.archived=1`, recoverable) and posts a closing note into both chats; `verified:false` keeps it open.
+- [x] `restart_client()`: gated — refused while another session's turn is running; runs `selfheal_restart_command`
+      if configured, else sets the store flag `restart_requested` for the supervisor/desktop to honour. Never
+      triggered automatically from observed error text.
+- [x] API (require_admin): `POST /api/sessions/{sid}/heal`, `GET /api/sessions/{sid}/heal`, `GET /api/heal`,
+      `POST /api/heal/{fix_sid}/confirm`, `POST /api/heal/{fix_sid}/restart`.
+- [x] UI `connector/static/selfheal-ui.js` (DOM-only, loaded from app.js): a **🔧 Починить** button on every
+      error/trace event, a fix-chat banner with confirm / restart (restart behind an explicit confirmation) and
+      a link back to the source.
+- [x] `auto_confirm_fixes` (**off by default**): when a fix chat's turn ends after a `run_command`/`exec_command`
+      result shows the checks passing, auto-confirm and archive. Conservative; never auto-restarts.
+- [ ] Owner acceptance: break the running build on purpose, click Починить, let the fix chat repair and verify,
+      confirm, and see the fix chat archive itself and (on request) restart the client.
+- [ ] Have the supervisor / desktop shell honour the `restart_requested` flag as a first-class restart path.
 
 ## Reliability and extended capabilities
 

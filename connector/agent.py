@@ -24,6 +24,17 @@ SUMMARY_REQUEST = ("Step budget for this turn is exhausted. Summarize briefly: w
 # A tool that waited this long really worked; it is not a loop even if the call repeats.
 LONG_TOOL_SECONDS = 60
 AUTO_CONTINUE = "Continue toward the goal; do not repeat completed steps."
+# The owner reads the result before anything else is sent on their behalf. Any activity in this
+# window cancels the continuation, so an automatic message never lands on top of a live reader.
+AUTO_CONTINUE_GRACE = 20
+# The in-flight turn of a session is persisted under this prefix, so a process that dies
+# mid-turn leaves evidence behind instead of a chat that silently stays "running" forever.
+TURN_KEY = "turn:"
+RESUME_KEY = "resume:"
+# Shown in place of an image dropped from the OUTGOING request to fit the byte budget.
+IMAGE_PLACEHOLDER = "[изображение убрано из контекста ради размера запроса]"
+# Floor the per-turn byte budget never drops below, even under repeated 413 recovery.
+MIN_REQUEST_BYTES = 1_000_000
 GOAL_STATUSES = ("active", "blocked", "done")
 GOAL_KINDS = ("analyze", "code", "fix", "generate", "verify", "deploy", "wait")
 STEP_STATUSES = ("pending", "in_progress", "completed")
@@ -90,6 +101,9 @@ class Agent:
         self._guidance_seen = {}
         self._prompt_cache = {}
         self._turn_failed = set()  # Sessions whose last turn ended in an error or a cancellation.
+        self._delivered = {}  # Sessions whose current turn actually produced an answer.
+        self.activity = {}  # Monotonic stamp of the last thing the owner did in a session.
+        self._auto_tasks = {}
         self.pending_images = {}
         self.pending_image_paths = {}
         self.delivered_images = {}
@@ -118,6 +132,11 @@ class Agent:
         if sum(not t.done() for t in self.jobs.values()) >= 24:
             raise ValueError("Очередь заполнена. Повторите позже.")
         self.continues[sid] = self.continues.get(sid, 0) + 1 if auto else 0
+        # A fresh message supersedes any resume offer, and the running turn becomes visible to the
+        # next boot: only a crash can leave this marker behind.
+        self.store.set_state(RESUME_KEY + sid, "")
+        self.mark_turn(sid, {"started": time.time(), "auto": bool(auto),
+                             "prompt": self.plain_text(content)[:4000]})
         self.store.execute("UPDATE sessions SET status='running' WHERE id=?", (sid,))
         runner = self.local.run if self.local and session.get("provider", "deepseek") != "deepseek" else self.run
         task = asyncio.create_task(runner(session, content))
@@ -127,8 +146,21 @@ class Agent:
     def _finished(self, sid, task):
         if self.jobs.get(sid) is task:
             self.jobs.pop(sid, None)
+            # The turn is over in this process: whatever happens next, the marker must not survive.
+            self.mark_turn(sid, None)
         if not task.cancelled():
             self.drain(sid)
+
+    def note_activity(self, sid):
+        """Anything the owner does resets the automatic budget and cancels a pending continuation."""
+        self.continues[sid] = 0
+        self.activity[sid] = time.monotonic()
+        task = self._auto_tasks.pop(sid, None)
+        if task and not task.done():
+            task.cancel()
+            # Announce it here: a task cancelled before its first step never runs its own handler.
+            self.store.event(sid, "notice", {"text": "Автопродолжение отменено — работаю по вашему сообщению."})
+        return True
 
     def submit(self, session, content, queue=True):
         """Accept a message at any moment: run it now, or queue it behind the running turn.
@@ -136,6 +168,7 @@ class Agent:
         A message sent mid-turn never interrupts the agent and never cancels pending output.
         """
         sid = session["id"]
+        self.note_activity(sid)
         # A message from the owner supersedes questions the agent left open: they stop hanging.
         for qid in self.store.close_questions(sid):
             self.store.event(sid, "background_answered", {"id": qid, "reason": "superseded"})
@@ -171,6 +204,91 @@ class Agent:
         except ValueError as exc:
             self.store.event(sid, "error", {"text": str(exc)})
             return False
+
+    # ------------------------------------------------------- a turn lost to a process restart
+    def mark_turn(self, sid, value):
+        """Persist that a turn is running, or clear it once the turn is really over."""
+        self.store.set_state(TURN_KEY + sid, json.dumps(value) if value else "")
+
+    @staticmethod
+    def _state_json(raw):
+        try:
+            data = json.loads(raw) if raw else {}
+        except ValueError:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def interrupted_turn(self, sid):
+        """The turn this session was running when the process died, as far as the database knows."""
+        return self._state_json(self.store.get_state(TURN_KEY + sid, ""))
+
+    def pending_resume(self, sid):
+        """An offer the owner has not accepted yet: the turn the restart cut in half."""
+        return self._state_json(self.store.get_state(RESUME_KEY + sid, "")) or None
+
+    def resume_text(self, sid):
+        """The instruction that hands a cut-off turn back to the agent without inventing new work."""
+        goal = self.goal(sid)
+        if goal.get("status") == "active" and goal.get("goal"):
+            return (f"Прерванный ход. Продолжай цель: «{goal['goal']}». Проверяй фактический результат "
+                    "инструментами и не повторяй уже выполненные шаги; когда цель достигнута — set_goal "
+                    "со status=done.")
+        prompt = (self.pending_resume(sid) or {}).get("prompt") or ""
+        return ("Прерванный ход: сервер перезапустился и ход был прерван. Проверь фактический результат "
+                "инструментами, продолжи с того места, где остановился, и не повторяй выполненные шаги."
+                + (f" Задача была: «{prompt}»." if prompt else ""))
+
+    def reconcile_restart(self):
+        """On boot nothing of the previous process runs any more — say so instead of pretending.
+
+        A turn marker left in the database is the fingerprint of a killed turn. Such a session is
+        continued by itself only when auto-continue is on and its goal is still open; otherwise the
+        lost turn stays an explicit offer that the owner accepts in the interface. Either way the
+        session stops advertising itself as running, and tool calls orphaned by the crash are closed.
+        """
+        resumed, interrupted = [], []
+        for session in self.store.sessions():
+            sid = session["id"]
+            lost = self.interrupted_turn(sid)
+            # 'approval' is stale as well: the future that waited for a click died with the process.
+            stale = session.get("status") in ("running", "approval")
+            if not lost and not stale:
+                continue
+            self.mark_turn(sid, None)
+            self.repair_history(sid)
+            self.store.execute("UPDATE sessions SET status='interrupted' WHERE id=?", (sid,))
+            goal = self.goal(sid)
+            if (session.get("auto_continue") and goal.get("status") == "active" and goal.get("goal")
+                    and not self.store.queued(sid)):
+                self.store.set_state(RESUME_KEY + sid, "")
+                self.store.queue_message(sid, self.resume_text(sid))
+                self.auto_pending.add(sid)
+                self.store.event(sid, "notice", {"text": "Сервер перезапустился во время хода — "
+                                                         "продолжаю цель автоматически.",
+                                                 "restart": True, "auto_continue": True})
+                resumed.append(sid)
+            else:
+                self.store.set_state(RESUME_KEY + sid, json.dumps({
+                    "prompt": lost.get("prompt", ""), "started": lost.get("started"),
+                    "auto": bool(lost.get("auto"))}))
+                self.store.event(sid, "notice", {"text": "Сервер перезапустился во время хода, и ход "
+                                                         "прерван. Нажмите «Продолжить», чтобы агент "
+                                                         "вернулся к цели.",
+                                                 "restart": True, "resume": True})
+                interrupted.append(sid)
+        return {"resumed": resumed, "interrupted": interrupted}
+
+    def accept_resume(self, session):
+        """The owner accepted the offer: the lost turn goes back to the agent, exactly once."""
+        sid = session["id"]
+        if self.busy(sid):
+            raise ValueError("Сессия уже работает.")
+        text = self.resume_text(sid)
+        result = self.submit(session, text)
+        self.store.set_state(RESUME_KEY + sid, "")
+        self.store.execute("UPDATE sessions SET status='running' WHERE id=?", (sid,))
+        self.store.event(sid, "notice", {"text": "Прерванный ход возобновлён."})
+        return result
 
     @staticmethod
     def plain_text(content):
@@ -249,11 +367,36 @@ class Agent:
                     "Проверь фактическое состояние прежде чем повторять шаг."})
 
     async def complete_with_retry(self, backend, sid, tools, delta, attempts=3):
-        """Transient provider faults must not end a turn; permanent ones are reported once."""
-        for attempt in range(1, attempts + 1):
+        """Transient provider faults must not end a turn; permanent ones are reported once.
+
+        HTTP 413 (request too large) is recovered rather than reported: the pre-send byte budget may
+        be higher than the provider's real limit, or a single message may be huge. The ladder halves
+        the per-turn byte budget (down to a floor) and sheds more images up to twice, then drops ALL
+        images and retries text-only, then surfaces a clear final error. Shedding is outgoing-copy
+        only, so the owner's stored history is never touched.
+        """
+        attempt, too_large, budget, drop_images = 0, 0, None, False
+        while True:
+            attempt += 1
             try:
-                return await backend.complete(self.context(sid), tools, delta)
+                messages = self.context(sid, request_budget=budget, drop_images=drop_images)
+                return await backend.complete(messages, tools, delta)
             except ProviderError as exc:
+                if getattr(exc, "too_large", False):
+                    too_large += 1
+                    if too_large <= 2:
+                        base = budget if budget is not None else self.config["max_request_bytes"]
+                        budget = max(MIN_REQUEST_BYTES, int(base) // 2)
+                        self.store.event(sid, "notice", {"text": "Провайдер отклонил запрос как слишком большой; "
+                                         f"уменьшаю бюджет до {budget} байт и повторяю ({too_large}/2)."})
+                        continue
+                    if not drop_images:
+                        drop_images = True
+                        self.store.event(sid, "notice", {"text": "Запрос всё ещё велик; убираю все изображения "
+                                                                 "и повторяю без них."})
+                        continue
+                    raise ProviderError(self.config.redact("Запрос слишком большой даже без изображений — "
+                                                           "уменьшите задачу или начните /new")) from None
                 if attempt >= attempts or not getattr(exc, "retryable", False):
                     raise
                 self.store.event(sid, "notice", {"text": f"Повтор запроса ({attempt}/{attempts - 1}): "
@@ -335,6 +478,94 @@ class Agent:
                                    for part in item["content"]]
             measured.append(item)
         return len(json.dumps(measured, ensure_ascii=False))
+
+    @staticmethod
+    def request_bytes(messages, tools=None):
+        """Byte size of the OUTGOING request body, base64 image data INCLUDED.
+
+        Unlike text_size (which strips base64 to measure model text for char trimming), this is the
+        real number the provider limits with HTTP 413. UTF-8 bytes, so Cyrillic counts truthfully.
+        """
+        payload = {"messages": messages, "tools": tools or []}
+        return len(json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8"))
+
+    @staticmethod
+    def _strip_images(message):
+        """A copy of a vision message with its image parts replaced by a short text placeholder.
+
+        Only the image_url parts go; any text part is kept. Role is unchanged, so tool-call
+        adjacency (well_formed) is untouched. Applying it twice is a no-op (no image_url left).
+        """
+        content = message.get("content")
+        if not isinstance(content, list) or not any(p.get("type") == "image_url" for p in content):
+            return message
+        kept = [p for p in content if p.get("type") != "image_url"]
+        kept.append({"type": "text", "text": IMAGE_PLACEHOLDER})
+        return dict(message, content=kept)
+
+    def _downgrade_images(self, message):
+        """A copy with each inline image re-encoded smaller (low detail). None if nothing changed."""
+        from .vision import downscale_image_part
+        content = message.get("content")
+        if not isinstance(content, list):
+            return None
+        cap = max(1, int(self.config["max_image_bytes"]))
+        changed, parts = False, []
+        for part in content:
+            if part.get("type") == "image_url":
+                smaller = downscale_image_part(part, cap)
+                if smaller is not None and smaller != part:
+                    parts.append(smaller)
+                    changed = True
+                    continue
+            parts.append(part)
+        return dict(message, content=parts) if changed else None
+
+    def shed_images(self, messages, tools=None, limit=None, drop_all=False):
+        """Fit the outgoing messages under the byte budget by shedding image payload first.
+
+        Deterministic and idempotent: a pure function of messages + config, so recomputing the same
+        input yields byte-identical output and the DeepSeek prefix cache is broken no more than the
+        change to the images themselves requires. Oldest vision frames are dropped first (they rarely
+        need full resolution later); the newest image is kept, then downgraded to low detail, then
+        dropped only as a last resort. Never removes a message, never reorders, never touches a tool
+        or assistant turn, so well_formed() is preserved.
+        """
+        limit = max(1, int(limit if limit is not None else self.config["max_request_bytes"]))
+        before = self.request_bytes(messages, tools)
+        if before <= limit and not drop_all:
+            return messages, {"shed": 0, "downgraded": 0, "freed": 0, "bytes": before, "limit": limit}
+        result = list(messages)
+        image_indices = [i for i, m in enumerate(result)
+                         if isinstance(m.get("content"), list)
+                         and any(p.get("type") == "image_url" for p in m["content"])]
+        shed = downgraded = 0
+        if drop_all:
+            for idx in image_indices:
+                stripped = self._strip_images(result[idx])
+                if stripped is not result[idx]:
+                    result[idx], shed = stripped, shed + 1
+            after = self.request_bytes(result, tools)
+            return result, {"shed": shed, "downgraded": 0, "freed": before - after,
+                            "bytes": after, "limit": limit}
+        # Drop oldest images first, keeping the newest image-bearing message intact if it can stay.
+        for idx in image_indices[:-1]:
+            if self.request_bytes(result, tools) <= limit:
+                break
+            result[idx] = self._strip_images(result[idx])
+            shed += 1
+        # Still over budget with the newest image present: downgrade it, then drop it as a last resort.
+        if image_indices and self.request_bytes(result, tools) > limit:
+            newest = image_indices[-1]
+            smaller = self._downgrade_images(result[newest])
+            if smaller is not None:
+                result[newest], downgraded = smaller, 1
+            if self.request_bytes(result, tools) > limit:
+                result[newest] = self._strip_images(result[newest])
+                shed, downgraded = shed + 1, 0
+        after = self.request_bytes(result, tools)
+        return result, {"shed": shed, "downgraded": downgraded, "freed": before - after,
+                        "bytes": after, "limit": limit}
 
     @staticmethod
     def compact_tool_results(history, keep_recent, minimum=COMPACT_MIN_CHARS, start=0):
@@ -454,16 +685,47 @@ class Agent:
         return {"known": known, "hit_tokens": hit, "miss_tokens": miss, "prompt_tokens": prompt,
                 "percent": round(100 * hit / prompt, 1) if known and prompt else None}
 
+    def last_request(self, sid):
+        """The last request as the PROVIDER counted it. No row, no number — nothing is invented."""
+        rows = self.store.rows("SELECT payload, created FROM usage WHERE session_id=? ORDER BY id DESC LIMIT 1",
+                               (sid,))
+        if not rows:
+            return {"known": False, "prompt_tokens": None, "completion_tokens": None, "created": None}
+        data = json.loads(rows[0]["payload"])
+        return {"known": data.get("prompt_tokens") is not None, "prompt_tokens": data.get("prompt_tokens"),
+                "completion_tokens": data.get("completion_tokens"), "created": rows[0]["created"]}
+
     def context_size(self, sid):
-        """What the composer meter shows: real fill of the budget that triggers trimming."""
+        """Two real numbers for the composer meter, and no invented third one.
+
+        `chars`/`percent` measure the request the agent WOULD send right now: after compaction,
+        against the budget that triggers trimming, so a full meter really means trimming is due
+        (reporting raw history here made the meter read 100% forever while requests were trimmed).
+        `provider_tokens`/`window_percent` are what the provider itself counted on the last request,
+        against the model window; before the first request they are absent and `estimated` is True
+        instead of a made-up token count.
+        """
         history = self.sanitize(self.store.history(sid))
-        chars = self.text_size(history)
+        raw = self.text_size(history)
         limit = max(1, self.config["max_context_chars"])
-        _, report = self.fit_context(sid, history, persist=False)
-        return {"chars": chars, "limit": limit, "percent": round(100 * chars / limit, 1),
-                "tokens": round(chars / 4), "limit_tokens": round(limit / 4),
+        view, report = self.fit_context(sid, history, persist=False)
+        sending = report["chars"]
+        max_request_bytes = max(1, int(self.config["max_request_bytes"]))
+        request_bytes = self.request_bytes(view)
+        window = max(1, int(self.config.values.get("context_window_tokens") or 128000))
+        provider = self.last_request(sid)
+        tokens = provider["prompt_tokens"] if provider["known"] else round(sending / 4)
+        return {"chars": sending, "limit": limit, "percent": round(100 * sending / limit, 1),
+                "tokens": round(sending / 4), "limit_tokens": round(limit / 4),
+                "raw_chars": raw, "raw_percent": round(100 * raw / limit, 1),
+                "raw_trimmed": report["changed"], "compacted_chars": sending,
+                "provider_tokens": provider["prompt_tokens"], "provider_known": provider["known"],
+                "provider_created": provider["created"], "estimated": not provider["known"],
+                "window_tokens": window, "window_percent": round(100 * tokens / window, 1),
                 "messages": len(history), "images": sum(isinstance(m.get("content"), list) for m in history),
-                "raw_chars": chars, "compacted_chars": report["chars"], "cache": self.cache_stats(sid)}
+                "cache": self.cache_stats(sid),
+                "request_bytes": request_bytes, "max_request_bytes": max_request_bytes,
+                "request_percent": round(100 * request_bytes / max_request_bytes, 1)}
 
     def guidance(self, sid):
         """Workspace orientation, loaded once per turn and reused by every step and every turn.
@@ -551,7 +813,7 @@ class Agent:
         return build_turn_note(datetime.now().astimezone().date().isoformat(),
                                self.goal(sid), self.background_note(sid))
 
-    def context(self, sid, tools=None):
+    def context(self, sid, tools=None, request_budget=None, drop_images=False):
         history, report = self.fit_context(sid)
         if report["changed"]:
             # Compacted output is gone from the conversation, so an "unchanged" read must not point at it.
@@ -580,6 +842,15 @@ class Agent:
         # well-formed history is returned byte-for-byte (the DeepSeek prefix cache is preserved) and a
         # malformed one — a late farm reply after an interleaved message — can never reach the API.
         messages = self.sanitize(messages)
+        # Byte budget: the char fit above ignores base64, but the real HTTP body carries it. Shed
+        # image payload (deterministically) to fit before the well_formed assertion, then re-assert:
+        # shedding only edits vision user-message content, so adjacency cannot break, but we verify.
+        messages, shed = self.shed_images(messages, tools, limit=request_budget, drop_all=drop_images)
+        if shed["shed"] or shed["downgraded"]:
+            self.store.event(sid, "context", {
+                "text": f"Убрано изображений из запроса: {shed['shed']}; освобождено байт: {shed['freed']}."
+                        + (f" Понижено до низкой детализации: {shed['downgraded']}." if shed["downgraded"] else ""),
+                **shed})
         assert self.well_formed(messages), "outgoing messages violate tool-call adjacency"
         return messages
 
@@ -693,14 +964,46 @@ class Agent:
                 self.store.event(sid, "notice", {"text": f"Автопродолжение остановлено на шаге {used}/{limit}. "
                                                          "Отправьте сообщение, чтобы продолжить цель."})
             return False
+        if not self._delivered.pop(sid, False):
+            # Nothing reached the owner this turn: continuing would repeat a silent round.
+            self.store.event(sid, "notice", {"text": "Ход завершился без результата — автопродолжение "
+                                                     "остановлено. Скажите, что делать дальше."})
+            return False
         text = (f"Продолжай цель: «{goal.get('goal', '')}». Проверяй фактический результат инструментами. "
                 f"Когда цель достигнута — set_goal со status=done; если нужен владелец — status=blocked. "
                 f"Автопродолжение {used + 1}/{limit}.")
+        self.store.event(sid, "notice", {
+            "text": f"Цель не закрыта. Продолжу сам через {AUTO_CONTINUE_GRACE} с ({used + 1}/{limit}) — "
+                    "напишите что угодно, и продолжение отменится.",
+            "auto_continue": used + 1, "limit": limit, "grace": AUTO_CONTINUE_GRACE})
+        previous = self._auto_tasks.pop(sid, None)
+        if previous and not previous.done():
+            previous.cancel()
+        try:
+            self._auto_tasks[sid] = asyncio.create_task(self._continue_later(session, text))
+        except RuntimeError:  # no running loop (tests calling this synchronously)
+            self._start_continuation(sid, text)
+        return True
+
+    def _start_continuation(self, sid, text):
         self.store.queue_message(sid, text)
         self.auto_pending.add(sid)
-        self.store.event(sid, "notice", {"text": f"Цель не закрыта — продолжаю автоматически ({used + 1}/{limit}).",
-                                         "auto_continue": used + 1, "limit": limit})
-        return True
+        return self.drain(sid)
+
+    async def _continue_later(self, session, text):
+        """Wait out the grace window, then continue only if nothing changed meanwhile."""
+        sid = session["id"]
+        marker = self.activity.get(sid)
+        try:
+            await asyncio.sleep(AUTO_CONTINUE_GRACE)
+        except asyncio.CancelledError:
+            raise  # note_activity already told the owner why
+        fresh = self.store.session(sid) or {}
+        if (self.activity.get(sid) != marker or self.busy(sid) or self.store.queued(sid)
+                or not fresh.get("auto_continue") or self.goal(sid).get("status") != "active"):
+            return False
+        self._auto_tasks.pop(sid, None)
+        return self._start_continuation(sid, text)
 
     async def run(self, session, content):
         sid = session["id"]
@@ -771,6 +1074,7 @@ class Agent:
                             self.store.event(sid, "assistant", {"text": message["content"], "phase": "commentary"})
                         else:
                             await self.tell(session, message["content"])
+                            self._delivered[sid] = True
                     if not calls:
                         break
                     for call in calls:
@@ -823,7 +1127,8 @@ class Agent:
                         self.delivered_images.setdefault(sid, set()).update(self.pending_image_paths.pop(sid, []))
                 else:
                     # A turn must never end on silence, even when the goal continues next turn.
-                    await self.final_summary(session, backend, tools)
+                    if await self.final_summary(session, backend, tools):
+                        self._delivered[sid] = True
                     if self.goal(sid).get("status") == "active" and (self.store.session(sid) or {}).get("auto_continue"):
                         self.store.event(sid, "notice", {"text": "Лимит шагов хода достигнут — продолжаю цель следующим ходом."})
                     else:
@@ -1134,7 +1439,8 @@ class Agent:
                 original.crop((x, y, x+w, y+h)).save(target)
             caption = f"Crop of {path.name} at x={x}, y={y}; add this offset to convert crop coordinates to source coordinates."
             path = target
-        parts = image_content(path, caption=caption, detail=detail)
+        parts = image_content(path, caption=caption, detail=detail,
+                              max_bytes=max(1, int(self.config["max_image_bytes"])))
         sid = session["id"]
         self.pending_images.setdefault(sid, []).extend(parts)
         name = path.relative_to(self.workspace(sid)).as_posix()

@@ -80,8 +80,8 @@ class Lifecycle:
         self.store.event(sid, "notice", {"text": "Перезапуск запланирован: сервер перезапустится на новой ревизии "
                                                  "сразу после завершения этого хода.", "restart": "scheduled"})
         return {"scheduled": True,
-                "note": "The restart happens right after this turn ends: finish the turn with a short report "
-                        "now. A message arrives after the restart asking you to verify the new revision."}
+                "note": "Перезапуск произойдёт сразу после завершения этого хода: заверши ход кратким отчётом "
+                        "по-русски. После перезапуска придёт сообщение с просьбой проверить новую ревизию."}
 
     # ------------------------------------------------------------------ the restart itself
     def pending(self):

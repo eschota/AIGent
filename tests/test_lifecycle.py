@@ -49,7 +49,7 @@ async def test_the_restart_waits_for_the_turn_and_queues_the_verification(bundle
 
     result = await agent.execute(session, "restart_server", {"reason": "checkpoint loop shipped"})
 
-    assert result["scheduled"] is True and "after this turn ends" in result["note"]
+    assert result["scheduled"] is True and "после завершения этого хода" in result["note"]
     request = json.loads(store.get_state(RESTART_FLAG, ""))
     assert request["sid"] == sid and request["reason"] == "checkpoint loop shipped"
     assert exits == [], "the tool itself never exits: the turn that called it is still running"
